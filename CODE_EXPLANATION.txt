@@ -1,0 +1,233 @@
+SENTINEL – LAYER 1 INGESTION PIPELINE: CODE EXPLANATION
+=========================================================
+
+OVERVIEW
+--------
+The ingestion layer is a containerised pipeline that replays PCAP network
+capture files through Zeek (a network analysis framework), extracts
+structured features from the resulting logs, and publishes those features
+as JSON messages to a Kafka topic called "network-features". A browser-based
+dashboard then consumes those messages live via WebSocket.
+
+The full data flow is:
+  PCAP file
+    → Zeek (packet analysis)
+    → conn.log / ssl.log / dns.log
+    → Python Feature Extractor (watchdog + pandas)
+    → Kafka topic: network-features
+    → WebSocket Dashboard (real-time UI)
+
+
+INFRASTRUCTURE: docker-compose.yml
+------------------------------------
+Defines six Docker services that share a private Docker network
+("sentinel-net") and a shared Docker volume ("zeek-logs"):
+
+  zookeeper   – confluentinc/cp-zookeeper:7.6.0
+                Kafka's metadata and coordination service.  Zeek and
+                the Python services do not talk to it directly.
+
+  kafka       – confluentinc/cp-kafka:7.6.0
+                The message broker.  Auto-creates topics on first use.
+                Internally reachable at kafka:9092.
+
+  kafka-ui    – provectuslabs/kafka-ui
+                A web console (port 9000) for browsing topic messages,
+                consumer groups, and partition offsets visually.
+
+  zeek        – custom build (ingestion/zeek/)
+                Runs Zeek against PCAP files and writes JSON logs to the
+                shared "zeek-logs" Docker volume.
+
+  feature-extractor – custom build (ingestion/)
+                Python service that watches "zeek-logs" for new conn.log
+                files and publishes extracted feature vectors to Kafka.
+
+  dashboard   – custom build (dashboard/)
+                FastAPI + WebSocket server (port 8080) that consumes
+                Kafka messages and streams them to the browser UI.
+
+Health checks ensure Kafka is fully ready before dependent services start.
+
+
+LAYER 1A – ZEEK (ingestion/zeek/)
+-----------------------------------
+Dockerfile
+  Base image: zeek/zeek:lts  (official LTS image, pre-built)
+  Adds: inotify-tools (for the file watcher in entrypoint.sh)
+
+entrypoint.sh
+  Purpose: Drive Zeek as a PCAP processor inside Docker.
+
+  1. On startup it scans /pcap/ for any *.pcap or *.pcapng files that
+     are already there and runs Zeek against each one immediately.
+
+  2. It then enters a blocking inotifywait loop, watching /pcap/ for new
+     files written or moved in.  Whenever one appears, it calls Zeek again.
+
+  3. For each PCAP, Zeek runs offline analysis:
+       zeek -r <file> LogAscii::use_json=T local
+     - "-r <file>" replays the capture instead of sniffing live traffic.
+     - "LogAscii::use_json=T" makes every log file output one JSON object
+       per line instead of the default tab-separated format.
+     - "local" loads Zeek's standard policy scripts, which activates
+       conn.log, dns.log, ssl.log, http.log, etc.
+
+  4. Logs are written into /zeek-logs/<pcap-basename>/ (the shared volume),
+     so the feature-extractor service can read them.
+
+  Key design: no set -euo pipefail, so a non-zero Zeek exit (e.g. on
+  malformed packets) is logged but does not crash the container.
+
+
+LAYER 1B – FEATURE EXTRACTOR (ingestion/)
+-------------------------------------------
+requirements.txt
+  confluent-kafka – Kafka producer client
+  pandas / numpy  – log parsing and numerical feature computation
+  watchdog        – file system event monitoring
+  python-dotenv   – environment variable loading
+
+main.py
+  Entry point.  Waits for Kafka to be reachable (up to 30 retries × 5 s),
+  then creates a FeatureProducer and starts the watchdog pipeline.
+
+features/extractor.py  —  THE CORE FEATURE ENGINEERING MODULE
+  Reads three Zeek JSON log files from a single log directory:
+    - conn.log  (primary source – one record per TCP/UDP/ICMP connection)
+    - ssl.log   (optional enrichment – TLS version, cipher, resumed flag)
+    - dns.log   (optional enrichment – query, qtype, rcode, answer count)
+
+  For each row in conn.log it builds a CESSNET-like feature vector.
+  CESSNET is a publicly available labelled network traffic dataset from
+  the Czech Technical University, designed for anomaly detection research.
+  The features extracted mirror that schema:
+
+  Identifiers:
+    uid, ts, src_ip, src_port, dst_ip, dst_port
+
+  Protocol:
+    proto       – raw string ("tcp", "udp", "icmp")
+    proto_enc   – integer encoding (0=tcp, 1=udp, 2=icmp, 3=other)
+    service     – application-layer service Zeek identified (e.g. "ssl")
+
+  Volume / timing:
+    duration        – connection duration in seconds
+    orig_bytes      – bytes sent by the originator
+    resp_bytes      – bytes sent by the responder
+    orig_pkts       – packet count, originator → responder
+    resp_pkts       – packet count, responder → originator
+    orig_ip_bytes   – IP-layer bytes, originator
+    resp_ip_bytes   – IP-layer bytes, responder
+    missed_bytes    – bytes Zeek could not capture (e.g. due to drops)
+
+  Derived ratios (key for anomaly detection):
+    bytes_ratio       – orig_bytes / resp_bytes
+    pkts_ratio        – orig_pkts / resp_pkts
+    avg_pkt_size_orig – orig_bytes / orig_pkts
+    avg_pkt_size_resp – resp_bytes / resp_pkts
+
+  Connection state (one-hot encoded across 13 states):
+    conn_state_SF, conn_state_S0, conn_state_REJ, conn_state_RSTO, ...
+    SF = normal full-close; S0 = SYN with no reply (potential scan);
+    REJ = connection refused; RSTO = reset by originator; etc.
+
+  TLS/SSL enrichment (joined on uid from ssl.log):
+    ssl_version, ssl_cipher, ssl_resumed, is_encrypted
+
+  DNS enrichment (joined on uid from dns.log):
+    dns_query, dns_qtype, dns_rcode, dns_answers, is_dns
+
+  Output: a Python list of dicts, one per connection.
+
+kafka/producer.py
+  Wraps the Confluent Kafka Producer.
+  - On startup, creates the "network-features" topic if it does not exist
+    (3 partitions, replication factor 1).
+  - publish(vectors) serialises each feature dict as UTF-8 JSON and sends
+    it to the topic, keyed by "<src_ip>-<uid>" for deterministic partitioning.
+  - Calls flush() after each batch to ensure delivery.
+
+pipeline/watcher.py
+  Uses the watchdog library to receive OS-level file system events.
+  - ZeekLogHandler.on_created / on_modified fires when any file inside
+    /zeek-logs/ is written.
+  - Only conn.log events trigger extraction (ssl.log and dns.log are
+    read by extractor.py directly during the same extraction pass).
+  - A 3-second settle delay prevents reading a file Zeek is still writing.
+  - On startup, it also bootstraps any conn.log files already present,
+    so PCAPs processed before the feature-extractor started are not lost.
+
+
+LAYER 1C – DASHBOARD (dashboard/)
+------------------------------------
+server.py  (FastAPI + WebSocket)
+  - GET /          serves index.html
+  - GET /health    returns {"status": "ok"}
+  - WS  /ws        bidirectional WebSocket endpoint
+
+  A background thread runs a Confluent Kafka Consumer subscribed to
+  "network-features".  Each message is decoded, wrapped in an envelope
+  {"type": "feature", "data": {...}}, and put into an asyncio Queue.
+  A broadcaster coroutine drains the queue and sends each envelope to
+  every connected WebSocket client simultaneously.
+
+index.html  (single-page real-time dashboard)
+  Pure HTML + vanilla JavaScript, no frameworks.
+  Connects to the WebSocket on load and handles three panels:
+
+  1. Stats bar  – live counters for total vectors, unique source IPs,
+                   protocol distribution (TCP/UDP/ICMP), and throughput
+                   (vectors/second over a rolling 5-second window).
+
+  2. Connection Log table  – one row per feature vector, displaying
+                   timestamp, src/dst IP:port, colour-coded protocol badge,
+                   service, bytes up/down, connection state, and duration.
+                   Auto-scrolls to newest entry, capped at 200 rows.
+
+  3. Feature Vector inspector  – shows the complete feature dict for the
+                   most recently received message, including all CESSNET
+                   fields, SSL enrichment, and DNS enrichment.
+
+  4. Activity Feed  – a chronological event log tagging each event as
+                   "kafka" (message received), "zeek" (log detected), or
+                   "extract" (features published).
+
+  Auto-reconnect: if the WebSocket drops, the browser retries every 3 s.
+
+
+SAMPLE PCAP: capture/generate_sample.py
+-----------------------------------------
+A Python script (requires scapy) that generates a synthetic 267-packet
+PCAP for demonstration without needing real traffic:
+
+  Normal traffic:
+    - 30 TCP flows across ports 80, 443, 22 (HTTP, HTTPS, SSH)
+    - 20 DNS queries to 8.8.8.8 for common domains
+    - 10 UDP flows + 5 ICMP echo/reply pairs
+
+  Anomalous traffic (to exercise the pipeline with interesting data):
+    - A TCP port scan from 172.16.0.55 across ports 20–44 against 10.0.0.1
+      (each port gets a lone SYN with no response → conn_state_S0)
+    - Two large TCP flows (65 KB payload each) from 172.16.0.55 to an
+      external IP, simulating data exfiltration
+
+
+HOW THE PIECES CONNECT AT RUNTIME
+------------------------------------
+1. docker compose up starts all services in dependency order.
+2. Zookeeper starts → Kafka starts (waits for ZK healthcheck).
+3. feature-extractor starts (waits for Kafka healthcheck), creates topic,
+   begins watching /zeek-logs/.
+4. dashboard starts (waits for Kafka healthcheck), ready for browser.
+5. zeek starts and immediately processes capture/pcap/sample.pcap,
+   writing /zeek-logs/sample/conn.log (+ ssl.log, dns.log, etc.).
+6. watchdog in feature-extractor detects /zeek-logs/sample/conn.log,
+   waits 3 s for Zeek to finish, extracts 92 feature vectors, publishes
+   them to the network-features topic.
+7. dashboard's Kafka consumer receives the 92 messages, broadcasts them
+   via WebSocket to any open browser tabs.
+8. Browser renders the connection log table and feature vector inspector
+   in real time.
+9. Drop any new PCAP into capture/pcap/ → Zeek detects it via inotifywait
+   and the cycle repeats automatically.

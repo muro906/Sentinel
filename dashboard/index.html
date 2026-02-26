@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sentinel – Ingestion Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    :root {
+      --bg:       #0a0b0f;
+      --surface:  #111318;
+      --surface2: #1a1d25;
+      --surface3: #22263000;
+      --border:   #2a2f3d;
+      --accent:   #00d4ff;
+      --accent2:  #7c3aed;
+      --green:    #10b981;
+      --yellow:   #f59e0b;
+      --red:      #ef4444;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --radius:   12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Animated grid background ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image:
+        linear-gradient(rgba(0,212,255,.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,212,255,.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Header ── */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(10,11,15,.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 28px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+
+    .logo {
+      display: flex; align-items: center; gap: 12px;
+    }
+
+    .logo-icon {
+      width: 36px; height: 36px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+
+    .logo h1 {
+      font-size: 18px; font-weight: 700;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.5px;
+    }
+
+    .logo span {
+      font-size: 11px; font-weight: 400;
+      color: var(--muted); letter-spacing: 2px;
+      text-transform: uppercase;
+      display: block; margin-top: -2px;
+    }
+
+    .header-status {
+      display: flex; align-items: center; gap: 20px;
+    }
+
+    .status-pill {
+      display: flex; align-items: center; gap: 7px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 5px 12px; border-radius: 20px;
+      font-size: 12px; font-weight: 500;
+    }
+
+    .status-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--red);
+      transition: background .3s;
+    }
+    .status-dot.connected { background: var(--green); animation: pulse-dot 2s infinite; }
+
+    @keyframes pulse-dot {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,.4); }
+      50% { box-shadow: 0 0 0 5px rgba(16,185,129,0); }
+    }
+
+    .counter-badge {
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #000; font-weight: 700; font-size: 11px;
+      padding: 3px 9px; border-radius: 12px;
+    }
+
+    /* ── Layout ── */
+    main {
+      position: relative; z-index: 1;
+      padding: 24px 28px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto auto 1fr;
+      gap: 20px;
+      max-width: 1600px;
+      margin: 0 auto;
+    }
+
+    /* ── Stat cards ── */
+    .stats-row {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      position: relative; overflow: hidden;
+      transition: border-color .2s, transform .2s;
+    }
+
+    .stat-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+
+    .stat-card::before {
+      content: '';
+      position: absolute; inset: 0;
+      background: linear-gradient(135deg, var(--accent) 0%, transparent 60%);
+      opacity: .04;
+      pointer-events: none;
+    }
+
+    .stat-label {
+      font-size: 11px; font-weight: 500;
+      text-transform: uppercase; letter-spacing: 1.5px;
+      color: var(--muted); margin-bottom: 10px;
+      display: flex; align-items: center; gap: 6px;
+    }
+
+    .stat-value {
+      font-size: 32px; font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      background: linear-gradient(90deg, var(--accent), #fff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      line-height: 1;
+    }
+
+    .stat-sub {
+      font-size: 11px; color: var(--muted); margin-top: 6px;
+    }
+
+    /* ── Panel ── */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      background: var(--surface2);
+    }
+
+    .panel-title {
+      font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 8px;
+    }
+
+    .panel-title .icon {
+      width: 22px; height: 22px; border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px;
+    }
+
+    .icon-blue  { background: rgba(0,212,255,.15); }
+    .icon-purple{ background: rgba(124,58,237,.15); }
+    .icon-green { background: rgba(16,185,129,.15); }
+
+    .badge {
+      font-size: 10px; font-weight: 700; font-family: 'JetBrains Mono', monospace;
+      background: var(--bg); border: 1px solid var(--border);
+      padding: 2px 7px; border-radius: 8px; color: var(--muted);
+    }
+
+    .panel-body {
+      flex: 1; overflow-y: auto;
+      max-height: 360px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .panel-body::-webkit-scrollbar { width: 4px; }
+    .panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* ── Log entry rows ── */
+    .log-entry {
+      display: grid;
+      grid-template-columns: 110px 130px 130px 60px 70px 80px 80px 1fr;
+      gap: 0;
+      border-bottom: 1px solid rgba(42,47,61,.5);
+      font-size: 11px; font-family: 'JetBrains Mono', monospace;
+      transition: background .15s;
+    }
+
+    .log-entry:hover { background: var(--surface2); }
+
+    .log-entry.new-entry {
+      animation: slideIn .3s ease;
+    }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateX(-8px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+
+    .log-entry .cell {
+      padding: 8px 10px;
+      border-right: 1px solid rgba(42,47,61,.4);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .log-entry .cell:last-child { border-right: none; }
+
+    .log-header {
+      display: grid;
+      grid-template-columns: 110px 130px 130px 60px 70px 80px 80px 1fr;
+      font-size: 10px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 1px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+
+    .log-header .cell {
+      padding: 8px 10px;
+      border-right: 1px solid rgba(42,47,61,.4);
+    }
+
+    .log-header .cell:last-child { border-right: none; }
+
+    .proto-badge {
+      display: inline-block;
+      padding: 1px 6px; border-radius: 4px;
+      font-size: 10px; font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .proto-tcp  { background: rgba(0,212,255,.15); color: var(--accent); }
+    .proto-udp  { background: rgba(124,58,237,.15); color: #a78bfa; }
+    .proto-icmp { background: rgba(245,158,11,.15); color: var(--yellow); }
+    .proto-other{ background: rgba(100,116,139,.15); color: var(--muted); }
+
+    /* ── Feature vector panel ── */
+    .feature-card {
+      margin: 12px 16px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .feature-card-header {
+      padding: 10px 14px;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px; font-weight: 600;
+      display: flex; justify-content: space-between;
+      color: var(--accent);
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+      padding: 4px 0;
+    }
+
+    .fv-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 5px 14px;
+      border-bottom: 1px solid rgba(42,47,61,.4);
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .fv-key { color: var(--muted); font-size: 10px; }
+    .fv-val { color: var(--text); font-weight: 500; }
+    .fv-val.highlight { color: var(--accent); }
+
+    /* ── Activity feed ── */
+    .feed-entry {
+      padding: 10px 16px;
+      border-bottom: 1px solid rgba(42,47,61,.4);
+      font-size: 11px; display: flex; gap: 10px; align-items: flex-start;
+      transition: background .15s;
+    }
+
+    .feed-entry:hover { background: var(--surface2); }
+    .feed-entry.new-entry { animation: slideIn .3s ease; }
+
+    .feed-time {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--muted); font-size: 10px;
+      min-width: 65px; padding-top: 1px;
+    }
+
+    .feed-content { flex: 1; }
+    .feed-label { font-weight: 600; color: var(--text); margin-bottom: 2px; }
+    .feed-detail { color: var(--muted); font-size: 10px; }
+
+    .tag {
+      display: inline-block; padding: 1px 6px; border-radius: 4px;
+      font-size: 9px; font-weight: 700; text-transform: uppercase;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .tag-kafka   { background: rgba(0,212,255,.1);  color: var(--accent); border: 1px solid rgba(0,212,255,.2); }
+    .tag-zeek    { background: rgba(124,58,237,.1); color: #a78bfa; border: 1px solid rgba(124,58,237,.2); }
+    .tag-extract { background: rgba(16,185,129,.1); color: var(--green); border: 1px solid rgba(16,185,129,.2); }
+
+    /* ── Full-width panel ── */
+    .full-width { grid-column: 1 / -1; }
+
+    /* ── Empty state ── */
+    .empty-state {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; padding: 40px 20px; color: var(--muted);
+      gap: 10px;
+    }
+
+    .empty-state .icon-lg { font-size: 36px; opacity: .4; }
+    .empty-state p { font-size: 13px; text-align: center; }
+    .empty-state code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px; color: var(--accent);
+      background: rgba(0,212,255,.08);
+      padding: 2px 8px; border-radius: 4px;
+    }
+
+    /* ── Scrollbar for panel body ── */
+    .panel-body { position: relative; }
+
+    /* ── Responsive ── */
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+      .stats-row { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">🛡️</div>
+    <div>
+      <h1>SENTINEL</h1>
+      <span>Network Ingestion Layer</span>
+    </div>
+  </div>
+  <div class="header-status">
+    <div class="status-pill">
+      <div class="status-dot" id="ws-dot"></div>
+      <span id="ws-label">Disconnected</span>
+    </div>
+    <div class="counter-badge" id="msg-counter">0 msgs</div>
+  </div>
+</header>
+
+<main>
+
+  <!-- Stat cards -->
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-label">📦 Vectors Published</div>
+      <div class="stat-value" id="stat-total">0</div>
+      <div class="stat-sub">total feature vectors → Kafka</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">🌐 Unique Sources</div>
+      <div class="stat-value" id="stat-sources">0</div>
+      <div class="stat-sub">distinct src IPs seen</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">🔁 Protocols</div>
+      <div class="stat-value" id="stat-protocols">—</div>
+      <div class="stat-sub">TCP / UDP / ICMP</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">⚡ Throughput</div>
+      <div class="stat-value" id="stat-rate">0</div>
+      <div class="stat-sub">vectors / sec (live)</div>
+    </div>
+  </div>
+
+  <!-- Connection log table -->
+  <div class="panel full-width" style="grid-column: 1/-1;">
+    <div class="panel-header">
+      <div class="panel-title">
+        <div class="icon icon-purple">📋</div>
+        Zeek Connection Log  <span class="tag tag-zeek" style="margin-left:6px">conn.log</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button onclick="clearLogs()" style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px;">Clear</button>
+        <span class="badge" id="log-count">0 entries</span>
+      </div>
+    </div>
+    <div class="log-header">
+      <div class="cell">Timestamp</div>
+      <div class="cell">Src IP</div>
+      <div class="cell">Dst IP</div>
+      <div class="cell">Proto</div>
+      <div class="cell">Service</div>
+      <div class="cell">↑ Bytes</div>
+      <div class="cell">↓ Bytes</div>
+      <div class="cell">State / Duration</div>
+    </div>
+    <div class="panel-body" id="log-body">
+      <div class="empty-state">
+        <div class="icon-lg">🌐</div>
+        <p>Waiting for Zeek logs…</p>
+        <p>Drop a <code>.pcap</code> file into <code>capture/pcap/</code></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Feature Vector panel -->
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">
+        <div class="icon icon-blue">🔬</div>
+        Latest Feature Vector  <span class="tag tag-extract" style="margin-left:6px">CESSNET-style</span>
+      </div>
+      <span class="badge" id="fv-uid">–</span>
+    </div>
+    <div class="panel-body" id="fv-body">
+      <div class="empty-state">
+        <div class="icon-lg">🧪</div>
+        <p>Feature vectors will appear here as connections are processed.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Activity Feed panel -->
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">
+        <div class="icon icon-green">⚡</div>
+        Pipeline Activity Feed
+      </div>
+      <span class="badge" id="feed-count">0 events</span>
+    </div>
+    <div class="panel-body" id="feed-body">
+      <div class="empty-state">
+        <div class="icon-lg">🔄</div>
+        <p>Pipeline events will stream here in real time.</p>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+  // ── State ─────────────────────────────────────────────────────────────────
+  let totalVectors = 0;
+  let srcIPs = new Set();
+  let protoCount = { tcp: 0, udp: 0, icmp: 0, other: 0 };
+  let feedCount = 0;
+  let logCount  = 0;
+  let recentTimestamps = [];
+  const MAX_ROWS = 200;
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────
+  let ws;
+  const WS_URL = `ws://${location.host}/ws`;
+
+  function connect() {
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      document.getElementById('ws-dot').classList.add('connected');
+      document.getElementById('ws-label').textContent = 'Live';
+      addFeedEvent('kafka', 'WebSocket connected', 'Listening for Kafka feature vectors…');
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const envelope = JSON.parse(evt.data);
+        if (envelope.type === 'feature') {
+          handleFeatureVector(envelope.data);
+        }
+      } catch(e) { console.error('Parse error', e); }
+      document.getElementById('msg-counter').textContent = totalVectors + ' msgs';
+      // keep-alive pong
+      ws.send('ping');
+    };
+
+    ws.onclose = () => {
+      document.getElementById('ws-dot').classList.remove('connected');
+      document.getElementById('ws-label').textContent = 'Reconnecting…';
+      setTimeout(connect, 3000);
+    };
+
+    ws.onerror = () => ws.close();
+  }
+
+  // ── Throughput ────────────────────────────────────────────────────────────
+  setInterval(() => {
+    const now = Date.now();
+    recentTimestamps = recentTimestamps.filter(t => now - t < 5000);
+    const rate = (recentTimestamps.length / 5).toFixed(1);
+    document.getElementById('stat-rate').textContent = rate;
+  }, 1000);
+
+  // ── Feature vector handler ────────────────────────────────────────────────
+  function handleFeatureVector(data) {
+    totalVectors++;
+    recentTimestamps.push(Date.now());
+
+    srcIPs.add(data.src_ip || '?');
+    const proto = (data.proto || 'other').toLowerCase();
+    protoCount[proto] = (protoCount[proto] || 0) + 1;
+
+    updateStats();
+    addLogRow(data);
+    updateFeatureVector(data);
+    addFeedEvent(
+      'kafka',
+      `Feature vector published → ${data.src_ip}:${data.src_port} → ${data.dst_ip}:${data.dst_port}`,
+      `proto=${data.proto} service=${data.service||'–'} bytes↑=${data.orig_bytes} bytes↓=${data.resp_bytes} state=${getState(data)}`,
+      data.uid
+    );
+  }
+
+  function getState(data) {
+    const states = ['SF','S0','S1','REJ','RSTO','RSTR','OTH'];
+    for (const s of states) {
+      if (data['conn_state_' + s]) return s;
+    }
+    return '?';
+  }
+
+  // ── Stats ─────────────────────────────────────────────────────────────────
+  function updateStats() {
+    document.getElementById('stat-total').textContent = totalVectors.toLocaleString();
+    document.getElementById('stat-sources').textContent = srcIPs.size.toLocaleString();
+    document.getElementById('stat-protocols').textContent =
+      `${protoCount.tcp}/${protoCount.udp}/${protoCount.icmp}`;
+    document.getElementById('msg-counter').textContent = totalVectors + ' msgs';
+  }
+
+  // ── Log table ─────────────────────────────────────────────────────────────
+  function addLogRow(d) {
+    const body = document.getElementById('log-body');
+    const empty = body.querySelector('.empty-state');
+    if (empty) empty.remove();
+
+    const state = getState(d);
+    const proto = (d.proto || 'other').toLowerCase();
+    const ts = d.ts ? new Date(parseFloat(d.ts) * 1000).toISOString().replace('T',' ').slice(0,19) : '–';
+
+    const row = document.createElement('div');
+    row.className = 'log-entry new-entry';
+    row.innerHTML = `
+      <div class="cell" title="${ts}">${ts}</div>
+      <div class="cell" title="${d.src_ip}:${d.src_port}">${d.src_ip || '?'}<span style="color:var(--muted)">:${d.src_port||0}</span></div>
+      <div class="cell" title="${d.dst_ip}:${d.dst_port}">${d.dst_ip || '?'}<span style="color:var(--muted)">:${d.dst_port||0}</span></div>
+      <div class="cell"><span class="proto-badge proto-${proto}">${proto}</span></div>
+      <div class="cell">${d.service || '–'}</div>
+      <div class="cell" style="color:var(--accent)">${fmtBytes(d.orig_bytes)}</div>
+      <div class="cell" style="color:#a78bfa">${fmtBytes(d.resp_bytes)}</div>
+      <div class="cell">${state} <span style="color:var(--muted)">${d.duration?d.duration.toFixed(3)+'s':'–'}</span></div>
+    `;
+    body.insertBefore(row, body.firstChild);
+    logCount++;
+    document.getElementById('log-count').textContent = logCount + ' entries';
+
+    // Trim to MAX_ROWS
+    const rows = body.querySelectorAll('.log-entry');
+    if (rows.length > MAX_ROWS) rows[rows.length-1].remove();
+  }
+
+  // ── Feature vector display ────────────────────────────────────────────────
+  function updateFeatureVector(d) {
+    document.getElementById('fv-uid').textContent = d.uid || '–';
+    const body = document.getElementById('fv-body');
+    body.innerHTML = '';
+
+    const CORE_FIELDS = [
+      ['src_ip', d.src_ip], ['src_port', d.src_port],
+      ['dst_ip', d.dst_ip], ['dst_port', d.dst_port],
+      ['proto',  d.proto],  ['service',  d.service||'–'],
+      ['duration', d.duration !== undefined ? d.duration.toFixed(4)+'s' : '–'],
+      ['orig_bytes', fmtBytes(d.orig_bytes)], ['resp_bytes', fmtBytes(d.resp_bytes)],
+      ['orig_pkts',  d.orig_pkts],  ['resp_pkts',  d.resp_pkts],
+      ['bytes_ratio', d.bytes_ratio !== undefined ? d.bytes_ratio.toFixed(3) : '–'],
+      ['pkts_ratio',  d.pkts_ratio  !== undefined ? d.pkts_ratio.toFixed(3)  : '–'],
+      ['avg_pkt_orig', fmtBytes(d.avg_pkt_size_orig)],
+      ['avg_pkt_resp', fmtBytes(d.avg_pkt_size_resp)],
+      ['missed_bytes',d.missed_bytes],
+      ['conn_state',  getState(d)],
+      ['is_encrypted',d.is_encrypted ? '✅ Yes':'❌ No'],
+      ['ssl_version', d.ssl_version||'–'], ['ssl_cipher',d.ssl_cipher||'–'],
+      ['is_dns',      d.is_dns ? '✅ Yes':'❌ No'],
+      ['dns_query',   d.dns_query||'–'],   ['dns_qtype',d.dns_qtype!==-1?d.dns_qtype:'–'],
+      ['dns_rcode',   d.dns_rcode!==-1?d.dns_rcode:'–'],
+    ];
+
+    const card = document.createElement('div');
+    card.className = 'feature-card';
+    card.innerHTML = `
+      <div class="feature-card-header">
+        <span>uid: ${d.uid}</span>
+        <span style="color:var(--muted)">${d.ts ? new Date(parseFloat(d.ts)*1000).toISOString() : '–'}</span>
+      </div>
+    `;
+
+    const grid = document.createElement('div');
+    grid.className = 'feature-grid';
+    CORE_FIELDS.forEach(([k, v]) => {
+      const row = document.createElement('div');
+      row.className = 'fv-row';
+      const isHighlight = ['src_ip','dst_ip','proto','orig_bytes','resp_bytes','conn_state','bytes_ratio'].includes(k);
+      row.innerHTML = `<span class="fv-key">${k}</span><span class="fv-val ${isHighlight?'highlight':''}">${v}</span>`;
+      grid.appendChild(row);
+    });
+    card.appendChild(grid);
+    body.appendChild(card);
+  }
+
+  // ── Activity feed ─────────────────────────────────────────────────────────
+  function addFeedEvent(type, label, detail, uid) {
+    const body = document.getElementById('feed-body');
+    const empty = body.querySelector('.empty-state');
+    if (empty) empty.remove();
+
+    const now = new Date();
+    const time = now.toTimeString().slice(0,8);
+
+    const tagClass = { kafka: 'tag-kafka', zeek: 'tag-zeek', extract: 'tag-extract' }[type] || 'tag-kafka';
+
+    const entry = document.createElement('div');
+    entry.className = 'feed-entry new-entry';
+    entry.innerHTML = `
+      <div class="feed-time">${time}</div>
+      <div class="feed-content">
+        <div class="feed-label">
+          <span class="tag ${tagClass}">${type}</span>
+          &nbsp;${label}
+        </div>
+        <div class="feed-detail">${detail || ''}</div>
+      </div>
+    `;
+    body.insertBefore(entry, body.firstChild);
+    feedCount++;
+    document.getElementById('feed-count').textContent = feedCount + ' events';
+
+    const entries = body.querySelectorAll('.feed-entry');
+    if (entries.length > 100) entries[entries.length-1].remove();
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function fmtBytes(b) {
+    if (b == null || b === 0) return '0 B';
+    const units = ['B','KB','MB','GB'];
+    let i = 0;
+    while (b >= 1024 && i < units.length-1) { b /= 1024; i++; }
+    return b.toFixed(1) + ' ' + units[i];
+  }
+
+  function clearLogs() {
+    document.getElementById('log-body').innerHTML = '';
+    logCount = 0;
+    document.getElementById('log-count').textContent = '0 entries';
+  }
+
+  // ── Boot ──────────────────────────────────────────────────────────────────
+  connect();
+</script>
+</body>
+</html>

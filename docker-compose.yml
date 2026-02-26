@@ -1,0 +1,110 @@
+networks:
+    sentinel-net:
+        driver: bridge
+
+volumes:
+    zeek-logs:
+
+
+services:
+    # ─── Zookeeper ────────────────────────────────────────────────────────────────
+    zookeeper:
+        image: confluentinc/cp-zookeeper:7.6.0
+        container_name: sentinel-zookeeper
+        environment:
+            ZOOKEEPER_CLIENT_PORT: 2181
+            ZOOKEEPER_TICK_TIME: 2000
+        networks:
+            - sentinel-net
+        healthcheck:
+            test: [ "CMD", "bash", "-c", "echo ruok | nc localhost 2181" ]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+
+    # ─── Kafka ────────────────────────────────────────────────────────────────────
+    kafka:
+        image: confluentinc/cp-kafka:7.6.0
+        container_name: sentinel-kafka
+        depends_on:
+            zookeeper:
+                condition: service_healthy
+        environment:
+            KAFKA_BROKER_ID: 1
+            KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+            KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+            KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+            KAFKA_LOG_RETENTION_HOURS: 2
+        networks:
+            - sentinel-net
+        healthcheck:
+            test: [ "CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list" ]
+            interval: 15s
+            timeout: 10s
+            retries: 8
+            start_period: 25s
+
+    # ─── Kafka UI ─────────────────────────────────────────────────────────────────
+    kafka-ui:
+        image: provectuslabs/kafka-ui:latest
+        container_name: sentinel-kafka-ui
+        depends_on:
+            kafka:
+                condition: service_healthy
+        environment:
+            KAFKA_CLUSTERS_0_NAME: sentinel
+            KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+        ports:
+            - "9000:8080"
+        networks:
+            - sentinel-net
+
+    # ─── Zeek ─────────────────────────────────────────────────────────────────────
+    zeek:
+        build:
+            context: ./ingestion/zeek
+            dockerfile: Dockerfile
+        container_name: sentinel-zeek
+        volumes:
+            - ./capture/pcap:/pcap:ro
+            - zeek-logs:/zeek-logs
+        networks:
+            - sentinel-net
+
+    # ─── Feature Extractor ────────────────────────────────────────────────────────
+    feature-extractor:
+        build:
+            context: ./ingestion
+            dockerfile: Dockerfile
+        container_name: sentinel-feature-extractor
+        depends_on:
+            kafka:
+                condition: service_healthy
+        environment:
+            KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+            KAFKA_TOPIC: network-features
+            ZEEK_LOG_DIR: /zeek-logs
+            LOG_LEVEL: INFO
+        volumes:
+            - zeek-logs:/zeek-logs:ro
+        networks:
+            - sentinel-net
+
+    # ─── Dashboard ────────────────────────────────────────────────────────────────
+    dashboard:
+        build:
+            context: ./dashboard
+            dockerfile: Dockerfile
+        container_name: sentinel-dashboard
+        depends_on:
+            kafka:
+                condition: service_healthy
+        environment:
+            KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+            KAFKA_TOPIC: network-features
+        ports:
+            - "8080:8080"
+        networks:
+            - sentinel-net
