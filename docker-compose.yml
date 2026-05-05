@@ -4,6 +4,9 @@ networks:
 
 volumes:
     zeek-logs:
+    pgdata:
+    redisdata:
+    ollama-models:
 
 
 services:
@@ -92,19 +95,82 @@ services:
         networks:
             - sentinel-net
 
-    # ─── Dashboard ────────────────────────────────────────────────────────────────
-    dashboard:
+    # ─── PostgreSQL (CVE + Asset DB) ────────────────────────────────────────────
+    postgres:
+        image: pgvector/pgvector:pg16
+        container_name: sentinel-postgres
+        environment:
+            POSTGRES_DB: sentinel
+            POSTGRES_USER: sentinel
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sentinel_dev}
+        volumes:
+            - pgdata:/var/lib/postgresql/data
+            - ./database/migrations:/docker-entrypoint-initdb.d
+        ports:
+            - "5432:5432"
+        networks:
+            - sentinel-net
+        healthcheck:
+            test: [ "CMD-SHELL", "pg_isready -U sentinel" ]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+
+    # ─── Redis (Agent State + Task Queues) ──────────────────────────────────────
+    redis:
+        image: redis:7-alpine
+        container_name: sentinel-redis
+        command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+        volumes:
+            - redisdata:/data
+        ports:
+            - "6379:6379"
+        networks:
+            - sentinel-net
+        healthcheck:
+            test: [ "CMD", "redis-cli", "ping" ]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+
+    # ─── Ollama (Local LLM Serving) ─────────────────────────────────────────────
+    ollama:
+        image: ollama/ollama:latest
+        container_name: sentinel-ollama
+        volumes:
+            - ollama-models:/root/.ollama
+        ports:
+            - "11434:11434"
+        networks:
+            - sentinel-net
+        healthcheck:
+            test: [ "CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1" ]
+            interval: 15s
+            timeout: 10s
+            retries: 5
+            start_period: 10s
+
+    # ─── Orchestrator Agent (Layer 3) ───────────────────────────────────────────
+    orchestrator:
         build:
-            context: ./dashboard
+            context: ./agentic
             dockerfile: Dockerfile
-        container_name: sentinel-dashboard
+        container_name: sentinel-orchestrator
         depends_on:
             kafka:
                 condition: service_healthy
+            redis:
+                condition: service_healthy
+            postgres:
+                condition: service_healthy
+            ollama:
+                condition: service_healthy
         environment:
             KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-            KAFKA_TOPIC: network-features
-        ports:
-            - "8080:8080"
+            REDIS_URL: redis://redis:6379
+            DATABASE_URL: postgresql://sentinel:${POSTGRES_PASSWORD:-sentinel_dev}@postgres:5432/sentinel
+            LLM_BASE_URL: http://ollama:11434
+            LLM_MODEL: mistral:7b-instruct-v0.3-q4_K_M
+            LOG_LEVEL: INFO
         networks:
             - sentinel-net

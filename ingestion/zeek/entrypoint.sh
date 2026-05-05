@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Sentinel – Zeek entrypoint
 # Processes existing PCAPs on startup, then watches for new ones.
+# Uses both inotifywait AND a polling loop as a fallback for bind-mount edge cases.
 
 PCAP_DIR="/pcap"
 LOG_BASE="/zeek-logs"
 
+# Track which files have already been processed
+declare -A PROCESSED
+
 process_pcap() {
     local pcap_file="$1"
-    # Strip both .pcap and .pcapng extensions
     local basename
     basename=$(basename "$pcap_file")
     basename="${basename%.pcapng}"
@@ -29,11 +32,12 @@ process_pcap() {
     else
         echo "[zeek] Done: ${basename}"
     fi
+    PROCESSED["$pcap_file"]=1 #mark the pcap as processed so that they are not processed again
 }
 
 echo "[zeek] Watching ${PCAP_DIR} for PCAP files..."
 
-# Process any PCAPs already present on startup
+# ── Process existing PCAPs on startup ─────────────────────────────────────────
 found=0
 for f in "${PCAP_DIR}"/*.pcap "${PCAP_DIR}"/*.pcapng; do
     if [ -f "$f" ]; then
@@ -45,13 +49,32 @@ if [ "$found" -eq 0 ]; then
     echo "[zeek] No existing PCAPs found. Waiting for new files..."
 fi
 
-# Watch for new PCAPs dropped into the directory
+# ── inotifywait watcher (background) ─────────────────────────────────────────
+# Runs in background so the polling loop can also run
 inotifywait -m -e close_write -e moved_to --format "%w%f" "${PCAP_DIR}" 2>/dev/null \
 | while IFS= read -r new_file; do
     case "$new_file" in
         *.pcap|*.pcapng)
-            echo "[zeek] New file detected: ${new_file}"
-            process_pcap "$new_file"
+            if [ -z "${PROCESSED[$new_file]+x}" ]; then
+                echo "[zeek] inotify: New file: ${new_file}"
+                process_pcap "$new_file"
+            fi
             ;;
     esac
+done &
+
+INOTIFY_PID=$!
+echo "[zeek] inotifywait started (pid ${INOTIFY_PID})"
+
+# ── Polling fallback loop ──────────────────────────────────────────────────────
+# Catches files that inotifywait misses (e.g. files copied across filesystems
+# or written by some tools that don't trigger close_write inside the container)
+while true; do
+    sleep 5
+    for f in "${PCAP_DIR}"/*.pcap "${PCAP_DIR}"/*.pcapng; do
+        if [ -f "$f" ] && [ -z "${PROCESSED[$f]+x}" ]; then
+            echo "[zeek] poll: New file detected: ${f}"
+            process_pcap "$f"
+        fi
+    done
 done
