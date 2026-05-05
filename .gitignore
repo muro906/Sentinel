@@ -1,0 +1,22 @@
+# Documentation
+docs/
+*.md
+*.html
+*.pdf
+
+# Secrets & environment
+.env
+
+# Python virtual environment
+.venv/
+
+# Capture data
+capture/pcap/
+*.pcap
+
+# Binary / credential helpers
+docker-credential-pass-*
+
+# Misc non-code files
+*.txt
+LICENSE
