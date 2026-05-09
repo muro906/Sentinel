@@ -25,10 +25,14 @@ Graph topology:
     └──────┬────────────┘
            │
     ┌──────▼────────────┐
-    │  publish_plans     │
-    └──────┬────────────┘
-           │
-          END  (dashboard takes over for approval → execution)
+    │  publish_plans     │──── execution failed? ──→ handle_failure ──┐
+    └──────┬────────────┘                                              │
+           │                                                           │
+          END  (dashboard takes over for approval → execution)         │
+                                                                       │
+    ┌──────────────────┐◄──────────────────────────────────────────────┘
+    │  handle_failure   │──── should_replan? ──→ generate_plans (loop)
+    └──────────────────┘                  └────→ END
 
 The approval and execution nodes are triggered externally (via Kafka messages
 from the dashboard/execution layer), not within this graph run. This keeps
@@ -51,6 +55,7 @@ from agentic.orchestrator.nodes import (
     handle_failure,
     should_continue_after_triage,
     should_replan_or_end,
+    should_handle_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,8 +102,15 @@ def build_orchestrator_graph() -> StateGraph:
     graph.add_edge("aggregate", "generate_plans")
     graph.add_edge("generate_plans", "publish_plans")
 
-    # Publish → end (approval handled externally)
-    graph.add_edge("publish_plans", END)
+    # Publish → end normally, or → handle_failure if execution came back failed
+    graph.add_conditional_edges(
+        "publish_plans",
+        should_handle_failure,
+        {
+            "handle_failure": "handle_failure",
+            "end": END,
+        }
+    )
 
     # Handle failure → conditional re-plan or end
     graph.add_conditional_edges(

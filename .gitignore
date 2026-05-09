@@ -1,7 +1,11 @@
 # Documentation
 docs/
-*.md
 *.html
+*.md
+*.pdf
+docs/architecture/
+*.html
+*.md
 *.pdf
 
 # Secrets & environment

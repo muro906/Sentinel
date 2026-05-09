@@ -554,6 +554,13 @@ def should_continue_after_triage(state: OrchestratorState) -> str:
     return "dispatch_agents"
 
 
+def should_handle_failure(state: OrchestratorState) -> str:
+    """After publish_plans: route to handle_failure if execution came back failed, else end."""
+    if state.get("execution_status") == "failed" and state.get("failed_actions"):
+        return "handle_failure"
+    return "end"
+
+
 def should_replan_or_end(state: OrchestratorState) -> str:
     """After execution results: re-plan on failure, or end."""
     if state.get("should_replan"):
