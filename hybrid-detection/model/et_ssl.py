@@ -17,7 +17,12 @@ from config.constants import (
 )
 
 class ETSSLEncoder(nn.Module):
-    """"""
+    """
+    This core encoder maps the input feature vector to a 64 dim vector
+    Consider it a function f_theta that maps x_i in R^20 to z_i in R^64
+
+    The module is kept after training and used for inference
+    """
     def __init__(self, dropout: float=0.3):
         super().__init__()
         self.net = nn.Sequential(
@@ -36,6 +41,7 @@ class ETSSLEncoder(nn.Module):
             nn.ReLU(),
 
             nn.Linear(ENCODER_HIDDEN_3, EMBEDDING_DIM)
+            # No activations in final layer as we use the raw embeddings for distance scoring
         )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
