@@ -18,33 +18,33 @@ Notes on CICFlowMeter datasets (Darknet2020 & IDS2018):
 
 # ── CIC-Darknet2020 column → unified feature name ────────────────────────────
 CIC_DARKNET2020_COLUMN_MAP = {
-    "Flow Duration":                 "duration",
-    "Total Fwd Packets":             "orig_pkts",
-    "Total Backward Packets":        "resp_pkts",
-    "Total Length of Fwd Packets":   "orig_bytes",
-    "Total Length of Bwd Packets":   "resp_bytes",
-    "Flow Packets/s":                "pkt_rate",
-    "Fwd Packet Length Mean":        "mean_pkt_size",
-    "Bwd Packet Length Mean":        "mean_resp_pkt_size",
-    "Protocol":                      "proto",   # numeric: 6=TCP, 17=UDP → use CICFLOWMETER_PROTO_MAP
-    "Destination Port":              "dst_port",
-    "Label":                         "label",   # "BENIGN" or attack type
+    "flow duration":                 "duration",
+    "total fwd packets":             "orig_pkts",
+    "total backward packets":        "resp_pkts",
+    "total length of fwd packets":   "orig_bytes",
+    "total length of bwd packets":   "resp_bytes",
+    "flow packets/s":                "pkt_rate",
+    "fwd packet length mean":        "mean_pkt_size",
+    "bwd packet length mean":        "mean_resp_pkt_size",
+    "protocol":                      "proto",   # numeric: 6=TCP, 17=UDP → use CICFLOWMETER_PROTO_MAP
+    "destination port":              "dst_port",
+    "label":                         "label",   # "BENIGN" or attack type
 }
 
 # ── CSE-CIC-IDS2018 column → unified feature name ────────────────────────────
 # Uses abbreviated CICFlowMeter-V3 headers (different from Darknet2020).
 CIC_IDS2018_COLUMN_MAP = {
-    "Flow Duration":    "duration",
-    "Tot Fwd Pkts":     "orig_pkts",
-    "Tot Bwd Pkts":     "resp_pkts",
-    "TotLen Fwd Pkts":  "orig_bytes",
-    "TotLen Bwd Pkts":  "resp_bytes",
-    "Flow Pkts/s":      "pkt_rate",
-    "Fwd Pkt Len Mean": "mean_pkt_size",
-    "Bwd Pkt Len Mean": "mean_resp_pkt_size",
-    "Protocol":         "proto",    # numeric: 6=TCP, 17=UDP → use CICFLOWMETER_PROTO_MAP
-    "Dst Port":         "dst_port",
-    "Label":            "label",    # "Benign" or attack type (note: not "BENIGN")
+    "flow duration":    "duration",
+    "tot fwd pkts":     "orig_pkts",
+    "tot bwd pkts":     "resp_pkts",
+    "totlen fwd pkts":  "orig_bytes",
+    "totlen bwd pkts":  "resp_bytes",
+    "flow pkts/s":      "pkt_rate",
+    "fwd pkt len mean": "mean_pkt_size",
+    "bwd pkt len mean": "mean_resp_pkt_size",
+    "protocol":         "proto",    # numeric: 6=TCP, 17=UDP → use CICFLOWMETER_PROTO_MAP
+    "dst port":         "dst_port",
+    "label":            "label",    # "Benign" or attack type (note: not "BENIGN")
 }
 
 # Protocol number → string name for CICFlowMeter datasets.
@@ -70,7 +70,7 @@ UNSW_MAP = {
     "dport":   "dst_port",
     "state":   "conn_state",        # Argus state → Zeek-compatible conn_state
     "service": "service",
-    "Label":   "label",             # 0=normal, 1=attack  (raw files use capital-L)
+    "label":   "label",             # 0=normal, 1=attack  (raw files: 'Label' → lowercased before rename)
 }
 
 # ── Normal class per dataset ──────────────────────────────────────────────────
