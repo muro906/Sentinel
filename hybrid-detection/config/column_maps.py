@@ -70,7 +70,7 @@ UNSW_MAP = {
     "dport":   "dst_port",
     "state":   "conn_state",        # Argus state → Zeek-compatible conn_state
     "service": "service",
-    "label":   "label",             # 0=normal, 1=attack
+    "Label":   "label",             # 0=normal, 1=attack  (raw files use capital-L)
 }
 
 # ── Normal class per dataset ──────────────────────────────────────────────────
