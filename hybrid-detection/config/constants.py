@@ -71,11 +71,11 @@ EMBEDDING_DIM    = 64   # z_i dimension (encoder output)
 PROJECTION_DIM   = 32   # h_i dimension (projection head, training only)
 
 # ── Training hyperparameters (paper values) ───────────────────────────────────
-BATCH_SIZE        = 1024   # bumped for GPU saturation; paper used 256 on CPU
+BATCH_SIZE        = 512    # CPU: 512 balances throughput and memory bandwidth
 LEARNING_RATE     = 1e-3   # paper: 0.001
 LR_DECAY_FACTOR   = 0.95   # paper: 0.95 decay every 10 epochs
 LR_DECAY_EPOCHS   = 10
-NUM_EPOCHS        = 60     # baseline epochs; Optuna uses 30, final training uses 80
+NUM_EPOCHS        = 30     # CPU baseline; Optuna uses 20, final training uses 50
 TEMPERATURE_TAU   = 0.1    # τ  – contrastive loss temperature
 GAMMA             = 0.5    # γ  – anomaly loss weight
 ALPHA_EMA         = 0.95   # α  – incremental centroid decay factor
