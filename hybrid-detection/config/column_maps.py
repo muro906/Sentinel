@@ -75,29 +75,31 @@ UNSW_MAP = {
 
 # ── Normal class per dataset ──────────────────────────────────────────────────
 LABEL_NORMAL = {
-    'darknet': 'benign',    # lowercased to match label normalisation in download cell
-    'ids2018': 'benign',    # lowercased to match label normalisation in download cell
+    # CIC-Darknet2020: no 'BENIGN' class exists. Normal traffic is Non-Tor and
+    # NonVPN (plain browsing/streaming). Tor/VPN/darknet subcategories are anomalous.
+    # Value is a frozenset so the download cell can do: label in LABEL_NORMAL[ds]
+    'darknet': frozenset({'non-tor', 'nonvpn'}),
+    'ids2018': 'benign',    # lowercased; CIC-IDS2018 uses 'Benign' → lowercased 'benign'
     'unsw':    0,
 }
 
 # ── Explicit anomaly class sets per dataset ───────────────────────────────────
 # Threat model decisions documented here.
 #
-# darknet:
-#   BENIGN = normal. All other classes anomalous, including:
-#   - Tor / VPN   → encrypted tunneling for C2 / exfiltration
-#   - DDoS / PortScan / Botnet / Infiltration → direct attacks
-#   None means "everything != LABEL_NORMAL[dataset]"
+# darknet (CIC-Darknet2020):
+#   Normal = Non-Tor + NonVPN (plain internet traffic, ~83% of dataset).
+#   Anomaly = all Tor/VPN darknet subcategories (Audio-Stream, Browsing, Chat,
+#   Email, P2P, Transfer, Video-Stream, VOIP via Tor or VPN).
+#   First Label column used; second Label column (subtype) is dropped.
 #
 # ids2018 (CSE-CIC-IDS2018):
 #   "Benign" = normal. All other classes anomalous:
 #   - DoS/DDoS attacks, Brute Force, Infiltration, Botnet, SQL Injection, XSS
-#   None means "everything != LABEL_NORMAL[dataset]"
 #
 # unsw:
-#   Binary — label=1 = attack. None means "everything != LABEL_NORMAL[dataset]"
+#   Binary — label=0 = normal, label=1 = attack.
 LABEL_ANOMALY = {
-    'darknet': None,   # all non-BENIGN classes
-    'ids2018': None,   # all non-Benign classes
+    'darknet': None,   # all labels not in LABEL_NORMAL['darknet']
+    'ids2018': None,   # all non-benign classes
     'unsw':    None,   # all label=1 rows
 }
