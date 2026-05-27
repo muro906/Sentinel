@@ -75,8 +75,8 @@ UNSW_MAP = {
 
 # ── Normal class per dataset ──────────────────────────────────────────────────
 LABEL_NORMAL = {
-    'darknet': 'BENIGN',
-    'ids2018': 'Benign',    # note lowercase 'enign'
+    'darknet': 'benign',    # lowercased to match label normalisation in download cell
+    'ids2018': 'benign',    # lowercased to match label normalisation in download cell
     'unsw':    0,
 }
 
