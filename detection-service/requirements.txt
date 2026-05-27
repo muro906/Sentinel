@@ -1,0 +1,6 @@
+# CPU-only PyTorch (much smaller than GPU build — inference only)
+torch==2.3.0+cpu --index-url https://download.pytorch.org/whl/cpu
+numpy==1.26.4
+scikit-learn==1.4.2
+joblib==1.4.2
+confluent-kafka==2.4.0
