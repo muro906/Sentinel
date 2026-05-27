@@ -61,9 +61,11 @@ def build_feature_vector(record: dict) -> np.ndarray:
     mean_resp_pkt_size = resp_bytes / (resp_pkts + 1.0)
 
     # 3. Log transforms (handle heavy-tailed distributions)
-    log_duration   = math.log1p(duration)
-    log_orig_bytes = math.log1p(orig_bytes)
-    log_resp_bytes = math.log1p(resp_bytes)
+    # Clamp to 0 before log1p — negative bytes/duration are physically impossible
+    # and only arise as data artefacts in some CSVs (e.g. UNSW-NB15).
+    log_duration   = math.log1p(max(duration,   0.0))
+    log_orig_bytes = math.log1p(max(orig_bytes,  0.0))
+    log_resp_bytes = math.log1p(max(resp_bytes,  0.0))
 
     # 4. Connection-state one-hot (6 classes: SF S0 REJ RSTO RSTR OTH)
     state_key = conn_state if conn_state in CONN_STATES else "OTH"
