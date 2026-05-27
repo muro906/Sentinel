@@ -174,3 +174,63 @@ services:
             LOG_LEVEL: INFO
         networks:
             - sentinel-net
+
+    # ─── ET-SSL Detection Service (Layer 2) ──────────────────────────────────
+    # Consumes: network-features   (from ingestion/feature-extractor)
+    # Produces: anomaly-alerts     (consumed by orchestrator)
+    #
+    # Before starting: place trained model artifacts in ./detection-service/models/
+    #   encoder_weights.pt  scaler.joblib  centroid.npy  model_meta.json
+    detection-service:
+        build:
+            context: ./detection-service
+            dockerfile: Dockerfile
+        container_name: sentinel-detection-service
+        depends_on:
+            kafka:
+                condition: service_healthy
+            feature-extractor:
+                condition: service_started
+        environment:
+            KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+            INPUT_TOPIC:    network-features
+            OUTPUT_TOPIC:   anomaly-alerts
+            MODEL_DIR:      /models
+            LOG_LEVEL:      INFO
+            # Optional: override calibrated threshold from Colab
+            # ANOMALY_THRESHOLD: "0.85"
+            # How many consecutive normal flows before EMA centroid update
+            EMA_UPDATE_EVERY: "1000"
+        volumes:
+            - ./detection-service/models:/models:ro
+        networks:
+            - sentinel-net
+        restart: unless-stopped
+gateway:
+    image: nginx:1.25-alpine
+    container_name: sentinel-gateway
+    ports: ["80:80","443:443"]
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./gateway/certs:/etc/nginx/certs:ro
+      - ./dashboard/frontend/dist:/usr/share/nginx/html:ro
+    depends_on: [dashboard-backend]
+    networks: [sentinel-net]
+
+dashboard-backend:
+    build:
+      context: ./dashboard/backend
+      dockerfile: Dockerfile
+    container_name: sentinel-dashboard-backend
+    expose: ["8000"]
+    depends_on:
+      kafka:    {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      redis:    {condition: service_healthy}
+    environment:
+      DATABASE_URL:            postgresql://sentinel:${POSTGRES_PASSWORD:-sentinel_dev}@postgres:5432/sentinel
+      REDIS_URL:               redis://redis:6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      JWT_SECRET_KEY:          ${JWT_SECRET_KEY:-change_me}
+      ALLOWED_ORIGINS:         '["https://sentinel.local"]'
+    networks: [sentinel-net]

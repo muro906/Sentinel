@@ -1,26 +1,72 @@
-# Documentation
-docs/
-*.html
-*.md
-*.pdf
-docs/architecture/
-*.html
-*.md
-*.pdf
-
-# Secrets & environment
+# ── Secrets & environment ─────────────────────────────────────
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
 
-# Python virtual environment
+# ── Python ────────────────────────────────────────────────────
 .venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
 
-# Capture data
+# ── Node / Frontend ───────────────────────────────────────────
+node_modules/
+dashboard/frontend/node_modules/
+dashboard/frontend/dist/
+dashboard/frontend/build/
+dashboard/frontend/.vite/
+frontend/.vite/
+*.local
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+/tmp/*.log
+uvicorn.log
+
+# ── IDE & editor ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Network capture ───────────────────────────────────────────
 capture/pcap/
 *.pcap
+*.pcapng
 
-# Binary / credential helpers
+# ── Binary helpers / credentials ──────────────────────────────
 docker-credential-pass-*
 
-# Misc non-code files
-*.txt
-LICENSE
+# ── Temp / one-off scripts ────────────────────────────────────
+generate_plans_traces.py
+
+# ── Documentation & research (generated / third-party) ────────
+docs/
+*.html
+*.pdf
+agentic_integration_guide.html
+s41598-025-08568-0.pdf
+
+# ── Misc ──────────────────────────────────────────────────────
+CODE_EXPLANATION.txt
+run_zeek.sh

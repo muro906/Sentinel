@@ -1,0 +1,52 @@
+@import "tailwindcss";
+@source "../src";
+
+/* Light mode tokens — dim slate, easy on the eyes */
+:root {
+  --bg-base:        #c8d0dc;
+  --bg-surface:     #d4dbe6;
+  --bg-raised:      #bac3d0;
+  --border:         #9aa5b4;
+  --text-primary:   #080f17;
+  --text-secondary: #1a2635;
+  --text-muted:     #3a4f62;
+  --bg-nav:         #b8c2cf;
+  --bg-header:      #bec8d4;
+}
+
+/* Dark mode tokens */
+.dark {
+  --bg-base:       #0f172a;
+  --bg-surface:    #1e293b;
+  --bg-raised:     #334155;
+  --border:        #334155;
+  --text-primary:  #f1f5f9;
+  --text-secondary:#94a3b8;
+  --text-muted:    #64748b;
+  --bg-nav:        #020617;
+  --bg-header:     #020617;
+}
+
+@layer base {
+  body {
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    @apply antialiased transition-colors duration-200;
+  }
+  ::-webkit-scrollbar { @apply w-1.5 h-1.5; }
+  ::-webkit-scrollbar-track { background: var(--bg-base); }
+  ::-webkit-scrollbar-thumb { background: var(--border); @apply rounded-full; }
+}
+
+@layer utilities {
+  .bg-theme-base    { background-color: var(--bg-base); }
+  .bg-theme-surface { background-color: var(--bg-surface); }
+  .bg-theme-raised  { background-color: var(--bg-raised); }
+  .bg-theme-nav     { background-color: var(--bg-nav); }
+  .bg-theme-header  { background-color: var(--bg-header); }
+  .border-theme     { border-color: var(--border); }
+  .text-theme-primary   { color: var(--text-primary); }
+  .text-theme-secondary { color: var(--text-secondary); }
+  .text-theme-muted     { color: var(--text-muted); }
+  .divide-theme > * + * { border-color: var(--border); }
+}
