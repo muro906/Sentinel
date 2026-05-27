@@ -67,6 +67,12 @@ docs/
 agentic_integration_guide.html
 s41598-025-08568-0.pdf
 
+# ── Notebooks (keep only clean versions) ──────────────────────
+# Ignore original notebooks that cause marshal errors
+hybrid-detection/notebooks/*.ipynb
+# Allow clean versions
+!hybrid-detection/notebooks/*_clean.ipynb
+
 # ── Misc ──────────────────────────────────────────────────────
 CODE_EXPLANATION.txt
 run_zeek.sh
