@@ -8,7 +8,7 @@ import logging
 
 logger = logging.getLogger("sentinel.zeek_parser.")
 
-def parse_kafka_messages(raw_value:bytes) -> dict:
+def parse_kafka_message(raw_value:bytes) -> dict:
 
     """
     Deserialize a Kafka message from the network-features topic.
