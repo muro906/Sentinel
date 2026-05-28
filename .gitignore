@@ -76,3 +76,4 @@ hybrid-detection/notebooks/*.ipynb
 # ── Misc ──────────────────────────────────────────────────────
 CODE_EXPLANATION.txt
 run_zeek.sh
+.env
