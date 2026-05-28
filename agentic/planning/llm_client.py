@@ -1,12 +1,12 @@
 """
 LLM Client
 ===========
-OpenAI-compatible client that works with Ollama (and vLLM) for local
-inference. Uses the Instructor library to enforce structured JSON output
-matching our ExecutionPlan schema.
+OpenAI-compatible client that works with Groq Cloud API for fast inference.
+Uses the Instructor library to enforce structured JSON output matching our 
+ExecutionPlan schema.
 
 Design:
-- Talks to Ollama's OpenAI-compatible endpoint (/v1/chat/completions)
+- Talks to Groq's OpenAI-compatible endpoint (/v1/chat/completions)
 - Instructor wraps the client to enforce JSON schema via constrained decoding
 - Falls back to raw JSON parsing if Instructor fails
 - Retries once on malformed output before giving up
@@ -27,15 +27,20 @@ logger = logging.getLogger(__name__)
 
 
 def _get_client() -> AsyncOpenAI:
-    """Create an AsyncOpenAI client pointed at the local Ollama instance."""
+    """Create an AsyncOpenAI client pointed at Groq Cloud API."""
     base_url = OrchestratorConfig.LLM_BASE_URL
-    # Ollama exposes OpenAI-compatible API at /v1
+    api_key = OrchestratorConfig.GROQ_API_KEY
+    
+    if not api_key:
+        raise ValueError("GROQ_API_KEY environment variable is required for Groq Cloud")
+    
+    # Groq uses standard OpenAI-compatible endpoint
     if not base_url.endswith("/v1"):
         base_url = base_url.rstrip("/") + "/v1"
 
     return AsyncOpenAI(
         base_url=base_url,
-        api_key="ollama",  # Ollama doesn't require a real key
+        api_key=api_key,
         timeout=120.0,
     )
 

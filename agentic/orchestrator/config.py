@@ -45,8 +45,9 @@ class OrchestratorConfig:
     ESCALATION_ON_TIMEOUT: bool = True
 
     # ── LLM ────────────────────────────────────────────────────────────────────
-    LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "http://localhost:11434")
-    LLM_MODEL: str = os.environ.get("LLM_MODEL", "mistral:7b-instruct-v0.3-q4_K_M")
+    LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1")
+    LLM_MODEL: str = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+    GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
 
     @classmethod
     def get_automation_tier(cls, confidence: float) -> str:

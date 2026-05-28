@@ -30,3 +30,7 @@ def get_agent(name: str, **kwargs) -> BaseAgent:
 def list_agents() -> list[str]:
     """Return all registered agent names."""
     return list(AGENT_REGISTRY.keys())
+
+
+# Export the registry for easy import
+agent_registry = AGENT_REGISTRY
