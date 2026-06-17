@@ -5,7 +5,6 @@
 *.pem
 *.key
 *.cert
-
 # ── Python ────────────────────────────────────────────────────
 .venv/
 __pycache__/
@@ -67,13 +66,54 @@ docs/
 agentic_integration_guide.html
 s41598-025-08568-0.pdf
 
-# ── Notebooks (keep only clean versions) ──────────────────────
-# Ignore original notebooks that cause marshal errors
-hybrid-detection/notebooks/*.ipynb
-# Allow clean versions
-!hybrid-detection/notebooks/*_clean.ipynb
+# ── Notebooks ─────────────────────────────────────────────────
+hybrid-detection/notebooks/
+.ipynb_checkpoints/
 
 # ── Misc ──────────────────────────────────────────────────────
 CODE_EXPLANATION.txt
 run_zeek.sh
 .env
+
+# ── Backup folders ────────────────────────────────────────────
+agentic.backup/
+
+# ── Datasets (large CSVs) ─────────────────────────────────────
+datasets/
+
+# ── Model checkpoints & training artifacts ────────────────────
+checkpoints/
+
+# ── Project report, research papers, presentations ────────────
+Project Report/
+
+# ── Gateway SSL certificates ──────────────────────────────────
+gateway/certs/
+*.crt
+
+# ── Claude Code settings ──────────────────────────────────────
+.claude/
+
+# ── Codebase documentation guides (not READMEs) ───────────────
+FULL_INTEGRATION_GUIDE.md
+TRAINING_INTEGRATION_CHECKLIST.md
+ALERT_WORKFLOW.md
+
+# ── One-off generation/utility scripts ────────────────────────
+generate_diagrams.py
+generate_docx.py
+generate_final_report.py
+read_existing_report.py
+capture_screenshots.py
+
+# ── Pre-built Python wheels ───────────────────────────────────
+detection-service/wheels/
+ingestion/wheels/
+
+# ── Local-only training code (HF Spaces is source of truth) ───
+hybrid-detection/hf_spaces/
+hybrid-detection/train_comprehensive.py
+hybrid-detection/recalibrate_threshold.py
+hybrid-detection/hf_spaces_train.py
+hybrid-detection/hf_spaces_eval.py
+hybrid-detection/extract_test_data.py
