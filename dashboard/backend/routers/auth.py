@@ -7,7 +7,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 
@@ -37,18 +37,11 @@ class ApproveUserRequest(BaseModel):
 
 
 async def _get_user(username: str) -> Optional[dict]:
-    """Fetch user record from database by username.
-    
-    Args:
-        username: The username to look up.
-        
-    Returns:
-        User dictionary with hashed_password, role, and status, or None if not found/inactive.
-    """
+    """Fetch user record from database by username (active or pending)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT username,hashed_password,role,status FROM users WHERE username=$1 AND is_active=TRUE",
+            "SELECT username,hashed_password,role,status,is_active FROM users WHERE username=$1",
             username
         )
     return dict(row) if row else None
@@ -71,10 +64,13 @@ async def login(response: Response, form: OAuth2PasswordRequestForm = Depends())
     user = await _get_user(form.username)
     if not user or not verify_password(form.password, user["hashed_password"]):
         raise HTTPException(401, "Invalid credentials")
-    
-    # Check if user is pending approval
+
     if user.get("status") == "pending":
-        raise HTTPException(403, "Account pending admin approval. Please wait for confirmation.")
+        raise HTTPException(403, "Your account is pending admin approval. You will be notified once approved.")
+    if user.get("status") == "denied":
+        raise HTTPException(403, "Your account registration was not approved. Contact your administrator.")
+    if not user.get("is_active"):
+        raise HTTPException(403, "Your account has been deactivated. Contact your administrator.")
     
     # Set long-lived refresh token in HTTP-only cookie
     response.set_cookie(
@@ -128,6 +124,25 @@ async def logout(response: Response) -> dict:
     """
     response.delete_cookie("refresh_token", path="/api/auth")
     return {"detail": "Logged out"}
+
+
+@router.get("/check-username")
+async def check_username(username: str = Query(..., min_length=3)) -> dict:
+    """Check if a username is available for registration.
+    
+    Args:
+        username: The username to check.
+        
+    Returns:
+        Dictionary with 'available' boolean.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchval(
+            "SELECT 1 FROM users WHERE username = $1 AND is_active = TRUE",
+            username
+        )
+        return {"available": existing is None}
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -281,6 +296,49 @@ async def approve_user(
         "role": body.role,
         "email_sent": True
     }
+
+
+class DenyUserRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.post("/deny-user/{user_id}")
+async def deny_user(
+    user_id: int,
+    body: DenyUserRequest,
+    admin: dict = Depends(admin_only)
+) -> dict:
+    """Deny a pending user registration."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT username, email, status FROM users WHERE id = $1", user_id
+        )
+        if not user:
+            raise HTTPException(404, "User not found")
+        if user["status"] != "pending":
+            raise HTTPException(400, "User is not pending approval")
+
+        await conn.execute(
+            "UPDATE users SET status = 'denied', is_active = FALSE WHERE id = $1",
+            user_id
+        )
+
+    if user["email"]:
+        await email_service.send_email(
+            to_email=user["email"],
+            subject="Sentinel SOC — Account Registration Update",
+            html_content=f"""
+            <p>Hello {user['username']},</p>
+            <p>Your account registration request has not been approved.</p>
+            {f"<p>Reason: {body.reason}</p>" if body.reason else ""}
+            <p>If you believe this is an error, please contact your system administrator.</p>
+            """,
+            text_content=f"Your Sentinel SOC account registration was not approved.{' Reason: ' + body.reason if body.reason else ''}"
+        )
+
+    logger.info(f"User denied: {user['username']} by admin")
+    return {"detail": "User registration denied", "username": user["username"]}
 
 
 class UpdateProfileRequest(BaseModel):

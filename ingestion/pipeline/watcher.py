@@ -18,10 +18,22 @@ from kafka.producer import FeatureProducer
 
 log = logging.getLogger(__name__)
 
-ZEEK_LOG_DIR = Path(os.getenv("ZEEK_LOG_DIR", "/zeek-logs"))
-# Minimum age (seconds) a log file should be before we process it
-# to avoid reading incomplete files that zeek is still writing.
-SETTLE_SECS = float(os.getenv("LOG_SETTLE_SECS", "3"))
+ZEEK_LOG_DIR    = Path(os.getenv("ZEEK_LOG_DIR", "/zeek-logs"))
+SETTLE_SECS     = float(os.getenv("LOG_SETTLE_SECS", "3"))
+# Persisted across container restarts so we never re-publish the same log.
+_PROCESSED_FILE = ZEEK_LOG_DIR / ".processed_logs"
+
+
+def _load_processed() -> set[str]:
+    try:
+        return set(_PROCESSED_FILE.read_text().splitlines())
+    except FileNotFoundError:
+        return set()
+
+
+def _mark_processed(path: str) -> None:
+    with open(_PROCESSED_FILE, "a") as f:
+        f.write(path + "\n")
 
 
 class ZeekLogHandler(FileSystemEventHandler):
@@ -30,7 +42,8 @@ class ZeekLogHandler(FileSystemEventHandler):
     def __init__(self, producer: FeatureProducer) -> None:
         super().__init__()
         self._producer = producer
-        self._processed: set[str] = set()
+        self._processed: set[str] = _load_processed()
+        log.info("[watcher] Loaded %d previously-processed log paths", len(self._processed))
 
     def _handle(self, path: Path) -> None:
         if path.suffix not in (".log",):
@@ -58,6 +71,7 @@ class ZeekLogHandler(FileSystemEventHandler):
         sent = self._producer.publish(vectors)
         log.info("[watcher] %d vectors published.", sent)
         self._processed.add(key)
+        _mark_processed(key)
 
     def on_created(self, event: FileCreatedEvent) -> None:
         if not event.is_directory:

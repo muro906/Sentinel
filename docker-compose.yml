@@ -1,34 +1,58 @@
 networks:
     sentinel-net:
         driver: bridge
+    # Isolated demo network — containers get the mock IPs seeded in seed_demo.py.
+    # The orchestrator is attached to both networks so asset-discovery can reach
+    # demo containers via ping / nmap.
+    demo-net:
+        driver: bridge
+        ipam:
+            config:
+                - subnet: 10.10.0.0/16
 
 volumes:
     zeek-logs:
     pgdata:
     redisdata:
-    ollama-models:
 
+
+# ── Startup order ──────────────────────────────────────────────────────────────
+#
+#  zookeeper (healthy)
+#   └─ kafka (healthy)
+#       ├─ kafka-ui
+#       ├─ zeek (started) ──► feature-extractor (started) ──► detection-service
+#       ├─ orchestrator          ◄── also: postgres (healthy), redis (healthy)
+#       └─ dashboard-backend     ◄── also: postgres (healthy), redis (healthy)
+#                    └─ healthy ──► gateway
+#
+#  postgres (healthy) ────────────────────────────────────────────────── ↑↑
+#  redis    (healthy) ────────────────────────────────────────────────── ↑↑
 
 services:
-    # ─── Zookeeper ────────────────────────────────────────────────────────────────
+
+    # ── Infrastructure ────────────────────────────────────────────────────────
+
     zookeeper:
         image: confluentinc/cp-zookeeper:7.6.0
         container_name: sentinel-zookeeper
+        restart: unless-stopped
         environment:
             ZOOKEEPER_CLIENT_PORT: 2181
             ZOOKEEPER_TICK_TIME: 2000
         networks:
             - sentinel-net
         healthcheck:
-            test: [ "CMD", "bash", "-c", "echo ruok | nc localhost 2181" ]
+            test: ["CMD-SHELL", "echo srvr | nc -w 2 localhost 2181 | grep -q Mode"]
             interval: 10s
             timeout: 5s
             retries: 5
+            start_period: 10s
 
-    # ─── Kafka ────────────────────────────────────────────────────────────────────
     kafka:
         image: confluentinc/cp-kafka:7.6.0
         container_name: sentinel-kafka
+        restart: unless-stopped
         depends_on:
             zookeeper:
                 condition: service_healthy
@@ -43,16 +67,16 @@ services:
         networks:
             - sentinel-net
         healthcheck:
-            test: [ "CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list" ]
+            test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
             interval: 15s
             timeout: 10s
             retries: 8
-            start_period: 25s
+            start_period: 30s
 
-    # ─── Kafka UI ─────────────────────────────────────────────────────────────────
     kafka-ui:
         image: provectuslabs/kafka-ui:latest
         container_name: sentinel-kafka-ui
+        restart: unless-stopped
         depends_on:
             kafka:
                 condition: service_healthy
@@ -64,41 +88,10 @@ services:
         networks:
             - sentinel-net
 
-    # ─── Zeek ─────────────────────────────────────────────────────────────────────
-    zeek:
-        build:
-            context: ./ingestion/zeek
-            dockerfile: Dockerfile
-        container_name: sentinel-zeek
-        volumes:
-            - ./capture/pcap:/pcap:ro
-            - zeek-logs:/zeek-logs
-        networks:
-            - sentinel-net
-
-    # ─── Feature Extractor ────────────────────────────────────────────────────────
-    feature-extractor:
-        build:
-            context: ./ingestion
-            dockerfile: Dockerfile
-        container_name: sentinel-feature-extractor
-        depends_on:
-            kafka:
-                condition: service_healthy
-        environment:
-            KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-            KAFKA_TOPIC: network-features
-            ZEEK_LOG_DIR: /zeek-logs
-            LOG_LEVEL: INFO
-        volumes:
-            - zeek-logs:/zeek-logs:ro
-        networks:
-            - sentinel-net
-
-    # ─── PostgreSQL (CVE + Asset DB) ────────────────────────────────────────────
     postgres:
         image: pgvector/pgvector:pg16
         container_name: sentinel-postgres
+        restart: unless-stopped
         environment:
             POSTGRES_DB: sentinel
             POSTGRES_USER: sentinel
@@ -107,19 +100,20 @@ services:
             - pgdata:/var/lib/postgresql/data
             - ./database/migrations:/docker-entrypoint-initdb.d
         ports:
-            - "5432:5432"
+            - "5433:5432"    # 5432 is taken by the host system postgres
         networks:
             - sentinel-net
         healthcheck:
-            test: [ "CMD-SHELL", "pg_isready -U sentinel" ]
+            test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
             interval: 10s
             timeout: 5s
             retries: 5
+            start_period: 15s
 
-    # ─── Redis (Agent State + Task Queues) ──────────────────────────────────────
     redis:
         image: redis:7-alpine
         container_name: sentinel-redis
+        restart: unless-stopped
         command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
         volumes:
             - redisdata:/data
@@ -128,95 +122,229 @@ services:
         networks:
             - sentinel-net
         healthcheck:
-            test: [ "CMD", "redis-cli", "ping" ]
+            test: ["CMD", "redis-cli", "ping"]
             interval: 10s
             timeout: 5s
             retries: 5
+            start_period: 5s
 
-    
-    # ─── Orchestrator Agent (Layer 3) ───────────────────────────────────────────
-    orchestrator:
+    # ── Ingestion pipeline (Layer 1) ──────────────────────────────────────────
+    # zeek → feature-extractor → detection-service → kafka[anomaly-alerts]
+
+    zeek:
         build:
-            context: ./agentic
+            context: ./ingestion/zeek
             dockerfile: Dockerfile
-        container_name: sentinel-orchestrator
-        depends_on:
-            kafka:
-                condition: service_healthy
-            redis:
-                condition: service_healthy
-            postgres:
-                condition: service_healthy
-        environment:
-            KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-            REDIS_URL: redis://redis:6379
-            DATABASE_URL: postgresql://sentinel:${POSTGRES_PASSWORD:-sentinel_dev}@postgres:5432/sentinel
-            LLM_BASE_URL: https://api.groq.com/openai/v1
-            LLM_MODEL: llama-3.1-8b-instant
-            GROQ_API_KEY: ${GROQ_API_KEY}
-            LOG_LEVEL: INFO
+        container_name: sentinel-zeek
+        restart: unless-stopped
+        # No Kafka/DB dependency — zeek only reads PCAPs and writes logs to a volume.
+        volumes:
+            - ./capture/pcap:/pcap:ro
+            - zeek-logs:/zeek-logs
         networks:
             - sentinel-net
 
-    # ─── ET-SSL Detection Service (Layer 2) ──────────────────────────────────
-    # Consumes: network-features   (from ingestion/feature-extractor)
-    # Produces: anomaly-alerts     (consumed by orchestrator)
-    #
-    # Before starting: place trained model artifacts in ./detection-service/models/
-    #   encoder_weights.pt  scaler.joblib  centroid.npy  model_meta.json
+    feature-extractor:
+        build:
+            context: ./ingestion
+            dockerfile: Dockerfile
+        container_name: sentinel-feature-extractor
+        restart: unless-stopped
+        depends_on:
+            kafka:
+                condition: service_healthy
+            zeek:
+                condition: service_started   # zeek must be up before we tail its logs
+        environment:
+            KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+            KAFKA_TOPIC: network-features
+            ZEEK_LOG_DIR: /zeek-logs
+            LOG_LEVEL: INFO
+        volumes:
+            - zeek-logs:/zeek-logs
+        networks:
+            - sentinel-net
+
+    # ── Detection service (Layer 2) ───────────────────────────────────────────
+    # Requires trained model artifacts in ./detection-service/models/
+    # For testing without the model run: docker-compose -f docker-compose.yml -f docker-compose.test.yml up
+
     detection-service:
         build:
             context: ./detection-service
             dockerfile: Dockerfile
         container_name: sentinel-detection-service
+        restart: unless-stopped
         depends_on:
             kafka:
                 condition: service_healthy
             feature-extractor:
-                condition: service_started
+                condition: service_started   # feature-extractor in turn waits for zeek
         environment:
             KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-            INPUT_TOPIC:    network-features
-            OUTPUT_TOPIC:   anomaly-alerts
-            MODEL_DIR:      /models
-            LOG_LEVEL:      INFO
-            # Optional: override calibrated threshold from Colab
-            # ANOMALY_THRESHOLD: "0.85"
-            # How many consecutive normal flows before EMA centroid update
+            INPUT_TOPIC:      network-features
+            OUTPUT_TOPIC:     anomaly-alerts
+            MODEL_DIR:        /models
+            LOG_LEVEL:        INFO
             EMA_UPDATE_EVERY: "1000"
+            # Per-model threshold overrides — tune these based on false positive rate.
+            # Leave unset to use the calibrated value from each model's model_meta.json.
+            # THRESHOLD_DARKNET:  "3.3"    # darknet model (calibrated: 3.3174)
+            # THRESHOLD_IDS2018:  "2.0"    # ids2018 model (uncalibrated — start here)
+            # THRESHOLD_UNSW:     "2.0"    # unsw model    (uncalibrated — start here)
         volumes:
             - ./detection-service/models:/models:ro
+            - ./hybrid-detection:/app/hybrid-detection:ro
         networks:
             - sentinel-net
-        restart: unless-stopped
 
-    # ─── Dashboard Backend ───────────────────────────────────────────────────────
+    # ── Agentic orchestrator (Layer 3) ────────────────────────────────────────
+
+    orchestrator:
+        build:
+            context: ./agentic
+            dockerfile: Dockerfile
+        container_name: sentinel-orchestrator
+        restart: unless-stopped
+        depends_on:
+            kafka:
+                condition: service_healthy
+            postgres:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+        environment:
+            KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+            DATABASE_URL: postgresql://sentinel:${POSTGRES_PASSWORD:-sentinel_dev}@postgres:5432/sentinel
+            REDIS_URL: redis://redis:6379
+            GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+            GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+            ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+            CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-haiku-4-5-20251001}
+            GROQ_API_KEY: ${GROQ_API_KEY:-}
+            GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+            LOG_LEVEL: INFO
+            DRY_RUN: "false"
+            DRY_RUN_ACTIONS: "firewall_block,isolate_host,firewall_unblock,restore_host,credential_rotate,rate_limit"
+        networks:
+            - sentinel-net
+            - demo-net   # allows ping/nmap of demo asset containers
+
+    # ── Dashboard ─────────────────────────────────────────────────────────────
+
     dashboard-backend:
         build:
-          context: ./dashboard/backend
-          dockerfile: Dockerfile
+            context: ./dashboard/backend
+            dockerfile: Dockerfile
         container_name: sentinel-dashboard-backend
-        expose: ["8000"]
+        restart: unless-stopped
         depends_on:
-          kafka:    {condition: service_healthy}
-          postgres: {condition: service_healthy}
-          redis:    {condition: service_healthy}
+            kafka:
+                condition: service_healthy
+            postgres:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
         environment:
-          DATABASE_URL:            postgresql://sentinel:${POSTGRES_PASSWORD:-sentinel_dev}@postgres:5432/sentinel
-          REDIS_URL:               redis://redis:6379
-          KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-          JWT_SECRET_KEY:          ${JWT_SECRET_KEY:-change_me}
-          ALLOWED_ORIGINS:         '["https://sentinel.local"]'
-        networks: [sentinel-net]
+            DATABASE_URL:            postgresql://sentinel:${POSTGRES_PASSWORD:-sentinel_dev}@postgres:5432/sentinel
+            REDIS_URL:               redis://redis:6379
+            KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+            JWT_SECRET_KEY:          ${JWT_SECRET_KEY:-change_me}
+            ALLOWED_ORIGINS:         '["https://sentinel.local","http://localhost"]'
+        expose:
+            - "8000"
+        networks:
+            - sentinel-net
+        healthcheck:
+            test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" 2>/dev/null || exit 1"]
+            interval: 15s
+            timeout: 5s
+            retries: 5
+            start_period: 20s
 
-    # ─── Gateway (Nginx) ───────────────────────────────────────────────────────────
     gateway:
         image: nginx:1.25-alpine
         container_name: sentinel-gateway
-        ports: ["80:80","443:443"]
+        restart: unless-stopped
+        depends_on:
+            dashboard-backend:
+                condition: service_healthy   # wait until the API is actually serving
+        ports:
+            - "80:80"
+            - "443:443"
         volumes:
-          - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
-          - ./gateway/certs:/etc/nginx/certs:ro
-          - ./dashboard/frontend/dist:/usr/share/nginx/html:ro
-        depends_on: [dashboard-backend]
-        networks: [sentinel-net]
+            - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+            - ./gateway/certs:/etc/nginx/certs:ro
+            - ./dashboard/frontend/dist:/usr/share/nginx/html:ro
+        networks:
+            - sentinel-net
+
+    # ── Demo mock-network containers (profile: demo) ──────────────────────────
+    # Run with:  docker-compose --profile demo up -d
+    # These give the asset-discovery agent real hosts to ping/nmap, producing
+    # richer enrichment data in the investigation traces.
+
+    demo-webserver:
+        image: nginx:alpine
+        container_name: sentinel-demo-webserver
+        hostname: web-server-01
+        restart: unless-stopped
+        networks:
+            demo-net:
+                ipv4_address: 10.10.1.10
+            sentinel-net: {}
+        profiles: [demo]
+        healthcheck:
+            test: ["CMD", "wget", "-qO-", "http://localhost"]
+            interval: 20s
+            timeout: 5s
+            retries: 3
+            start_period: 5s
+
+    demo-appserver:
+        image: mysql:8.0
+        container_name: sentinel-demo-appserver
+        hostname: app-server-01
+        restart: unless-stopped
+        environment:
+            MYSQL_ROOT_PASSWORD: demo_pass
+            MYSQL_DATABASE: appdb
+        networks:
+            demo-net:
+                ipv4_address: 10.10.2.10
+            sentinel-net: {}
+        profiles: [demo]
+        healthcheck:
+            test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pdemo_pass"]
+            interval: 20s
+            timeout: 5s
+            retries: 5
+            start_period: 30s
+
+    demo-fileserver:
+        image: alpine
+        container_name: sentinel-demo-fileserver
+        hostname: file-server-01
+        restart: unless-stopped
+        command: >
+            sh -c "apk add --no-cache openssh &&
+                   ssh-keygen -A &&
+                   echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config &&
+                   /usr/sbin/sshd -D -e"
+        networks:
+            demo-net:
+                ipv4_address: 10.10.2.20
+            sentinel-net: {}
+        profiles: [demo]
+
+    demo-workstation:
+        image: alpine
+        container_name: sentinel-demo-workstation
+        hostname: analyst-ws-01
+        restart: unless-stopped
+        command: tail -f /dev/null
+        networks:
+            demo-net:
+                ipv4_address: 10.10.3.100
+            sentinel-net: {}
+        profiles: [demo]

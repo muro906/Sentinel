@@ -53,6 +53,36 @@ async def list_cves(
     return {"items": [dict(r) for r in rows], "total": total}
 
 
+async def upsert_cves(cves: list) -> None:
+    """Upsert a list of CVE dicts (from NVD) into cve_entries."""
+    if not cves:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        for c in cves:
+            await conn.execute(
+                """
+                INSERT INTO cve_entries (
+                    cve_id, description, cvss_v3_score, cvss_v3_vector, severity,
+                    published_date, modified_date, affected_vendor, affected_product,
+                    affected_versions, attack_vector, attack_complexity,
+                    privileges_required, user_interaction, exploit_available
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                ON CONFLICT (cve_id) DO UPDATE SET
+                    description       = EXCLUDED.description,
+                    cvss_v3_score     = EXCLUDED.cvss_v3_score,
+                    severity          = EXCLUDED.severity,
+                    modified_date     = EXCLUDED.modified_date,
+                    exploit_available = EXCLUDED.exploit_available
+                """,
+                c["cve_id"], c["description"], c["cvss_v3_score"], c["cvss_v3_vector"],
+                c["severity"], c["published_date"], c["modified_date"],
+                c["affected_vendor"], c["affected_product"], c["affected_versions"],
+                c["attack_vector"], c["attack_complexity"],
+                c["privileges_required"], c["user_interaction"], c["exploit_available"],
+            )
+
+
 async def get_cve(cve_id: str) -> Optional[dict]:
     """Get detailed information about a specific CVE.
     

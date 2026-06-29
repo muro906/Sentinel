@@ -109,14 +109,20 @@ async def approve_plan(
         raise HTTPException(404, "Alert not found")
 
     # ── Ownership check ───────────────────────────────────────────────────────
-    # Analysts may only act on alerts assigned to them.
-    # Admin and senior_analyst can act on any alert.
+    # Plans may only be acted on by the analyst the alert is assigned to.
+    # Unassigned alerts cannot be approved by anyone.
     assigned_to = inc.get("assigned_to")
-    if user.role == "analyst" and assigned_to and assigned_to != user.username:
+    if not assigned_to:
+        raise HTTPException(
+            403,
+            "This alert is not assigned to anyone. "
+            "Assign it to yourself before approving plans."
+        )
+    if assigned_to != user.username:
         raise HTTPException(
             403,
             f"This alert is assigned to '{assigned_to}'. "
-            "Only the assigned analyst, a Senior Analyst, or an Admin can approve plans."
+            "Only the assigned analyst can approve plans."
         )
 
     # Check priority restrictions
@@ -188,11 +194,17 @@ async def escalate_for_approval(
 
         # ── Ownership check ────────────────────────────────────────────────────
         assigned_to = alert["assigned_to"]
-        if user.role == "analyst" and assigned_to and assigned_to != user.username:
+        if not assigned_to:
+            raise HTTPException(
+                403,
+                "This alert is not assigned to anyone. "
+                "Assign it to yourself before escalating plans."
+            )
+        if assigned_to != user.username:
             raise HTTPException(
                 403,
                 f"This alert is assigned to '{assigned_to}'. "
-                "Only the assigned analyst, a Senior Analyst, or an Admin can escalate plans."
+                "Only the assigned analyst can escalate plans."
             )
 
 
@@ -378,6 +390,80 @@ async def pickup_escalation(
     }
 
 
+class ReplanRequest(BaseModel):
+    reason: str
+
+
+@router.post("/{alert_id}/replan")
+async def request_replan(
+    alert_id: str,
+    body: ReplanRequest,
+    user: CurrentUser = Depends(get_current_user),
+    _: None = Depends(analyst_or_above),
+) -> dict:
+    """Trigger a fresh investigation after rejecting unsatisfactory plans.
+
+    Publishes a new message to the ``investigation-requests`` Kafka topic with
+    the analyst's rejection reason as ``replan_context``.  The orchestrator
+    passes this context to the LLM so it adjusts its strategy.
+    """
+    import json as _json, os, time
+    from confluent_kafka import Producer
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        alert = await conn.fetchrow(
+            "SELECT approval_status, assigned_to FROM incidents WHERE alert_id=$1",
+            alert_id,
+        )
+        if not alert:
+            raise HTTPException(404, "Alert not found")
+        if alert["assigned_to"] != user.username:
+            raise HTTPException(
+                403,
+                f"Alert is assigned to '{alert['assigned_to']}'. "
+                "Only the assigned analyst can request a replan.",
+            )
+        if alert["approval_status"] not in ("plans_generated", "rejected"):
+            raise HTTPException(
+                400,
+                f"Cannot replan an alert with status '{alert['approval_status']}'.",
+            )
+        # Reset status so the UI shows investigation is running again
+        await conn.execute(
+            "UPDATE incidents SET approval_status='triaged' WHERE alert_id=$1",
+            alert_id,
+        )
+
+    # Publish to Kafka — orchestrator picks this up and runs process_investigation
+    # with replan_context set, which the LLM prompt surfaces to adjust strategy.
+    try:
+        bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+        producer = Producer({"bootstrap.servers": bootstrap})
+        producer.produce(
+            "investigation-requests",
+            key=alert_id.encode(),
+            value=_json.dumps({
+                "alert_id":       alert_id,
+                "requested_by":   user.username,
+                "replan_context": body.reason,
+                "timestamp":      time.time(),
+            }).encode(),
+        )
+        producer.flush(timeout=5.0)
+    except Exception as exc:
+        logger.warning("Replan Kafka publish failed: %s", exc)
+
+    await manager.broadcast("feed", {
+        "type": "investigation_started",
+        "alert_id": alert_id,
+        "started_by": user.username,
+        "replan": True,
+    })
+
+    return {"detail": "Replan requested", "alert_id": alert_id, "status": "triaged"}
+
+
 @router.post("/{alert_id}/reject")
 async def reject_plan(
     alert_id: str,
@@ -396,6 +482,26 @@ async def reject_plan(
     Returns:
         Confirmation message.
     """
+    # Get alert details to check assignment
+    inc = await get_incident(alert_id)
+    if not inc:
+        raise HTTPException(404, "Alert not found")
+
+    # ── Ownership check ───────────────────────────────────────────────────────
+    assigned_to = inc.get("assigned_to")
+    if not assigned_to:
+        raise HTTPException(
+            403,
+            "This alert is not assigned to anyone. "
+            "Assign it to yourself before rejecting plans."
+        )
+    if assigned_to != user.username:
+        raise HTTPException(
+            403,
+            f"This alert is assigned to '{assigned_to}'. "
+            "Only the assigned analyst can reject plans."
+        )
+
     await record_approval(
         alert_id, body.get("plan_id", ""), user.username,
         [], body.get("reason"), decision="rejected"

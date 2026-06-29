@@ -56,6 +56,11 @@ async def get_trace(
         return await _from_redis(alert_id)
     if source == "postgres":
         return await get_trace_from_db(alert_id)
-    # Auto: prefer Redis for live data, fallback to Postgres
-    events = await _from_redis(alert_id)
-    return events if events else await get_trace_from_db(alert_id)
+    # Auto: Postgres is the durable source of truth.
+    # Augment with any Redis events whose event_id isn't in Postgres yet
+    # (i.e. written in the last few seconds and not yet committed).
+    db_events = await get_trace_from_db(alert_id)
+    db_ids = {e.get("event_id") for e in db_events}
+    redis_events = await _from_redis(alert_id)
+    live_only = [e for e in redis_events if e.get("event_id") not in db_ids]
+    return db_events + live_only

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { AlertCircle, ShieldOff, Filter, RefreshCw, ChevronRight } from 'lucide-react'
+import { AlertCircle, ShieldOff, Filter, RefreshCw, ChevronRight, Search } from 'lucide-react'
 import api from '../lib/api'
 import { Badge } from '../components/ui/Badge'
 import { PageSpinner } from '../components/ui/Spinner'
@@ -31,9 +31,19 @@ export default function MyAlerts() {
   const navigate = useNavigate()
   const username = useAuthStore(s => s.userName)
   const [filters, setFilters] = useState({ priority: '', status: '' })
+  const [search, setSearch] = useState('')
 
   const { data, isLoading, refetch, isFetching } = useMyAlerts(filters)
-  const alerts = data?.items ?? []
+  const searchLower = search.trim().toLowerCase()
+  const alerts = (data?.items ?? []).filter(a => {
+    if (!searchLower) return true
+    return (
+      a.classification?.toLowerCase().includes(searchLower) ||
+      a.alert_id?.toLowerCase().includes(searchLower) ||
+      a.src_ip?.toLowerCase().includes(searchLower) ||
+      a.dst_ip?.toLowerCase().includes(searchLower)
+    )
+  })
 
   if (isLoading) return <PageSpinner />
 
@@ -66,6 +76,17 @@ export default function MyAlerts() {
       {/* Filters */}
       <div className="flex items-center gap-3 flex-wrap">
         <Filter size={13} className="text-theme-muted" />
+        {/* Text search */}
+        <div className="relative">
+          <Search size={12} className="absolute left-2.5 top-2 text-theme-muted" />
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search classification, IP, ID…"
+            className="bg-theme-raised border border-theme text-xs text-theme-primary rounded pl-7 pr-3 py-1.5 focus:outline-none focus:border-blue-500 w-48"
+          />
+        </div>
         <select
           id="my-alerts-priority-filter"
           value={filters.priority}
@@ -104,7 +125,7 @@ export default function MyAlerts() {
           <div className="flex flex-col items-center justify-center py-20 gap-3">
             <ShieldOff size={32} className="text-theme-muted opacity-40" />
             <p className="text-sm text-theme-muted">
-              {filters.priority || filters.status
+              {search.trim() || filters.priority || filters.status
                 ? 'No alerts match your filters'
                 : 'No alerts are currently assigned to you'}
             </p>

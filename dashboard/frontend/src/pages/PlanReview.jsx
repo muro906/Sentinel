@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   ChevronLeft, CheckCircle, XCircle, AlertTriangle,
-  ArrowUpCircle, Lock, Pencil, Plus, Trash2, Save
+  ArrowUpCircle, Lock, Pencil, Plus, Trash2, Save, RefreshCw
 } from 'lucide-react'
 import { useMutation } from '@tanstack/react-query'
 import { usePlans, useApprovePlan, useRejectPlan } from '../hooks/usePlans'
@@ -18,6 +18,22 @@ import api from '../lib/api'
 const DESTRUCTIVE = new Set(['isolate_host','firewall_block','firewall_unblock','restore_host','credential_rotate'])
 const ACTION_TYPES = ['firewall_block','firewall_unblock','isolate_host','restore_host','patch','notify','deep_inspect','rate_limit','credential_rotate']
 const HISTORY_STATUSES = new Set(['approved','rejected','executed','closed'])
+
+// ── Replan mutation ──────────────────────────────────────────────────────────
+function useReplan(alertId, { onDone } = {}) {
+  const toast = useToastStore(s => s.push)
+  return useMutation({
+    mutationFn: (reason) =>
+      api.post(`/plans/${alertId}/replan`, { reason }).then(r => r.data),
+    onSuccess: () => {
+      toast({ type: 'info', title: 'Replan requested', message: 'New investigation running — plans will update shortly.' })
+      onDone?.('replan')
+    },
+    onError: (err) => {
+      toast({ type: 'error', title: 'Replan failed', message: err?.response?.data?.detail || 'Could not trigger replan' })
+    },
+  })
+}
 
 // ── Escalate mutation ────────────────────────────────────────────────────────
 function useEscalate(alertId, { onDone } = {}) {
@@ -66,15 +82,12 @@ function PlanEditor({ plan, onSave, onCancel }) {
       {actions.map((a, i) => (
         <div key={a._key} className="bg-theme-base border border-theme rounded-lg p-3 space-y-2">
           <div className="flex gap-2 items-center">
-            <select
+            <input
               value={a.action_type}
               onChange={e => update(i, 'action_type', e.target.value)}
+              placeholder="Action type (e.g., firewall_block, isolate_host)"
               className="flex-1 bg-theme-surface border border-theme rounded px-2 py-1 text-xs text-theme-primary focus:outline-none focus:border-blue-500"
-            >
-              {ACTION_TYPES.map(t => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
+            />
             {DESTRUCTIVE.has(a.action_type) && (
               <span className="text-[10px] text-red-400 font-medium uppercase">destructive</span>
             )}
@@ -133,16 +146,19 @@ export default function PlanReview() {
   const approve  = useApprovePlan(id, { onDone })
   const reject   = useRejectPlan(id,  { onDone })
   const escalate = useEscalate(id,    { onDone })
+  const replan   = useReplan(id,      { onDone })
 
   // Local state
-  const [editingPlan,    setEditingPlan]    = useState(null)   // plan being edited
-  const [editedPlans,    setEditedPlans]    = useState({})     // planId → modified plan
+  const [editingPlan,    setEditingPlan]    = useState(null)
+  const [editedPlans,    setEditedPlans]    = useState({})
   const [confirmPlan,    setConfirmPlan]    = useState(null)
   const [pendingApprove, setPendingApprove] = useState(null)
   const [rejectPlan,     setRejectPlan]     = useState(null)
   const [rejectReason,   setRejectReason]   = useState('')
   const [escalatePlan,   setEscalatePlan]   = useState(null)
   const [escalateReason, setEscalateReason] = useState('')
+  const [replanReason,   setReplanReason]   = useState('')
+  const [showReplan,     setShowReplan]     = useState(false)
 
   if (isLoading || loadingAlert) return <PageSpinner />
 
@@ -151,22 +167,22 @@ export default function PlanReview() {
   const plans = rawPlans.map(p => editedPlans[p.plan_id] ?? p)
 
   const isAnalyst  = role === 'analyst'
-  const isElevated = role === 'admin' || role === 'senior_analyst'
 
   // ── Already resolved? ──────────────────────────────────────────────────────
   const isResolved = alert ? HISTORY_STATUSES.has(alert.approval_status) : false
 
   // ── Ownership ──────────────────────────────────────────────────────────────
+  // Only the assigned analyst can act on plans. Unassigned = view-only.
   const assignedTo = alert?.assigned_to ?? null
   const isMyAlert  = assignedTo === userName
-  const canAct     = !isResolved && (isElevated ? true : isMyAlert)
+  const canAct     = !isResolved && isMyAlert
 
   const lockedReason = isResolved
     ? `This alert has already been ${alert.approval_status}. No further plan actions are available.`
     : !canAct
     ? assignedTo
-      ? `This alert is assigned to '${assignedTo}'. Only the assigned analyst, a Senior Analyst, or an Admin can review plans.`
-      : 'This alert is not assigned to you. Assign it to yourself before reviewing plans.'
+      ? `This alert is assigned to '${assignedTo}'. Only the assigned analyst can review plans.`
+      : 'This alert is not assigned to anyone. Assign it to yourself before reviewing plans.'
     : null
 
   // ── Handlers ───────────────────────────────────────────────────────────────
@@ -226,12 +242,21 @@ export default function PlanReview() {
       {lockedReason && (
         <div className="mb-4 flex items-start gap-2 p-3 rounded-lg bg-red-950/30 border border-red-700/40 text-xs">
           <Lock size={14} className="text-red-400 mt-0.5 shrink-0" />
-          <div>
+          <div className="flex-1">
             <p className="text-red-300 font-medium">
               {isResolved ? 'Alert already resolved' : 'Plan actions are locked'}
             </p>
             <p className="text-red-400/70 mt-0.5">{lockedReason}</p>
           </div>
+          {/* Allow the assigned analyst to replan even from a rejected/plans_generated state */}
+          {!isResolved && isMyAlert && (
+            <button
+              onClick={() => setShowReplan(true)}
+              className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300 shrink-0 transition-colors"
+            >
+              <RefreshCw size={11} /> Replan
+            </button>
+          )}
         </div>
       )}
 
@@ -463,7 +488,7 @@ export default function PlanReview() {
         </div>
       )}
 
-      {/* Reject dialog */}
+      {/* Reject dialog — with optional replan offer */}
       {rejectPlan && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
           <div className="bg-theme-surface border border-theme rounded-xl w-full max-w-md mx-4 p-6">
@@ -471,23 +496,95 @@ export default function PlanReview() {
             <textarea
               className="w-full bg-theme-base border border-theme rounded px-3 py-2 text-xs text-theme-primary
                          focus:outline-none focus:border-blue-500 resize-none"
-              rows={4}
+              rows={3}
               placeholder="Reason for rejection…"
               value={rejectReason}
               onChange={e => setRejectReason(e.target.value)}
               autoFocus
             />
+            {/* Replan toggle */}
+            <label className="flex items-center gap-2 mt-3 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={showReplan}
+                onChange={e => setShowReplan(e.target.checked)}
+                className="accent-blue-500"
+              />
+              <span className="text-xs text-theme-secondary">
+                Also request a re-investigation (agent restrategizes with your feedback)
+              </span>
+            </label>
+            {showReplan && (
+              <textarea
+                className="w-full mt-2 bg-theme-base border border-blue-600/40 rounded px-3 py-2 text-xs
+                           text-theme-primary focus:outline-none focus:border-blue-500 resize-none"
+                rows={2}
+                placeholder="What should the agent do differently? (e.g. 'plans are too aggressive — prefer network isolation over full block')"
+                value={replanReason}
+                onChange={e => setReplanReason(e.target.value)}
+              />
+            )}
             <div className="flex justify-end gap-2 mt-3">
-              <button onClick={() => setRejectPlan(null)}
+              <button onClick={() => { setRejectPlan(null); setRejectReason(''); setShowReplan(false); setReplanReason('') }}
                 className="px-4 py-1.5 text-xs rounded bg-theme-raised text-theme-secondary">Cancel</button>
               <button
                 id="confirm-reject-btn"
                 onClick={() => {
                   reject.mutate({ plan_id: rejectPlan, reason: rejectReason })
-                  setRejectPlan(null); setRejectReason('')
+                  if (showReplan && replanReason.trim()) {
+                    replan.mutate(replanReason.trim())
+                  }
+                  setRejectPlan(null); setRejectReason(''); setShowReplan(false); setReplanReason('')
                 }}
-                className="px-4 py-1.5 text-xs rounded bg-red-700 hover:bg-red-600 text-white font-semibold"
-              >Reject</button>
+                className="px-4 py-1.5 text-xs rounded bg-red-700 hover:bg-red-600 text-white font-semibold flex items-center gap-1.5"
+              >
+                {showReplan && replanReason.trim()
+                  ? <><XCircle size={12} /> Reject & Replan</>
+                  : <><XCircle size={12} /> Reject</>}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Standalone replan dialog (triggered from locked-state banner) */}
+      {!rejectPlan && showReplan && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="bg-theme-surface border border-theme rounded-xl w-full max-w-md mx-4 p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <RefreshCw size={16} className="text-blue-400" />
+              <h2 className="text-sm font-semibold text-theme-primary">Request Re-investigation</h2>
+            </div>
+            <p className="text-xs text-theme-secondary mb-3">
+              Tell the agent what was wrong with the previous plans and how to adjust its strategy.
+            </p>
+            <textarea
+              className="w-full bg-theme-base border border-theme rounded px-3 py-2 text-xs text-theme-primary
+                         focus:outline-none focus:border-blue-500 resize-none"
+              rows={4}
+              placeholder="e.g. 'Plans were too aggressive — the affected server is production-critical. Prefer deep inspection before any blocking actions.'"
+              value={replanReason}
+              onChange={e => setReplanReason(e.target.value)}
+              autoFocus
+            />
+            <div className="flex justify-end gap-2 mt-3">
+              <button onClick={() => { setShowReplan(false); setReplanReason('') }}
+                className="px-4 py-1.5 text-xs rounded bg-theme-raised text-theme-secondary">Cancel</button>
+              <button
+                id="confirm-replan-btn"
+                onClick={() => {
+                  if (replanReason.trim()) {
+                    replan.mutate(replanReason.trim())
+                    setShowReplan(false); setReplanReason('')
+                  }
+                }}
+                disabled={!replanReason.trim() || replan.isPending}
+                className="px-4 py-1.5 text-xs rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-50
+                           text-white font-semibold flex items-center gap-1.5"
+              >
+                {replan.isPending ? <Spinner className="h-3 w-3" /> : <RefreshCw size={12} />}
+                Replan
+              </button>
             </div>
           </div>
         </div>

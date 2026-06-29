@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ChevronLeft } from 'lucide-react'
+import { ChevronLeft, Search } from 'lucide-react'
 import { useTrace } from '../hooks/useTrace'
 import { PageSpinner } from '../components/ui/Spinner'
 import { timeAgo, cn } from '../lib/utils'
@@ -23,11 +23,22 @@ export default function TraceViewer() {
   const { events, isLoading } = useTrace(id)
   const [expanded, setExpanded] = useState(new Set())
   const [filter,   setFilter]   = useState('')
+  const [search,   setSearch]   = useState('')
 
   if (isLoading) return <PageSpinner />
 
-  const agents  = [...new Set(events.map(e => e.agent_name))]
-  const visible = filter ? events.filter(e => e.agent_name === filter) : events
+  const agents  = [...new Set(events.map(e => e.agent))]
+  const searchLower = search.trim().toLowerCase()
+  const visible = events.filter(e => {
+    if (filter && e.agent !== filter) return false
+    if (!searchLower) return true
+    return (
+      e.action?.toLowerCase().includes(searchLower) ||
+      e.rationale?.toLowerCase().includes(searchLower) ||
+      e.agent?.toLowerCase().includes(searchLower) ||
+      e.event_type?.toLowerCase().includes(searchLower)
+    )
+  })
 
   return (
     <div>
@@ -40,9 +51,20 @@ export default function TraceViewer() {
       <div className="flex items-center justify-between mb-5">
         <h1 className="text-base font-semibold text-theme-primary">
           Reasoning Trace
-          <span className="ml-2 text-xs text-theme-muted font-normal">{events.length} events</span>
+          <span className="ml-2 text-xs text-theme-muted font-normal">{visible.length} of {events.length} events</span>
         </h1>
-        <div className="flex gap-1.5">
+        <div className="flex gap-2 items-center">
+          <div className="relative">
+            <Search size={12} className="absolute left-2.5 top-2 text-theme-muted" />
+            <input
+              type="text"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search traces…"
+              className="bg-theme-raised border border-theme text-xs text-theme-primary rounded pl-7 pr-3 py-1.5 focus:outline-none focus:border-blue-500 w-40"
+            />
+          </div>
+          <div className="flex gap-1.5">
           <button onClick={() => setFilter('')}
             className={cn('px-2.5 py-1 text-xs rounded', !filter ? 'bg-blue-600 text-white' : 'bg-theme-raised text-theme-secondary')}>
             All
@@ -55,6 +77,7 @@ export default function TraceViewer() {
           ))}
         </div>
       </div>
+      </div>
 
       <div className="relative">
         {/* Vertical line */}
@@ -66,7 +89,7 @@ export default function TraceViewer() {
             return (
               <div key={e.event_id} className="pl-9 relative">
                 {/* Dot */}
-                <div className={cn('absolute left-1.5 top-3 w-3 h-3 rounded-full border-2 border-theme-base', dot(e.agent_name))} />
+                <div className={cn('absolute left-1.5 top-3 w-3 h-3 rounded-full border-2 border-theme-base', dot(e.agent))} />
 
                 <div
                   className="bg-theme-surface border border-theme rounded-lg p-3 cursor-pointer hover:bg-theme-raised transition-colors"
@@ -78,7 +101,7 @@ export default function TraceViewer() {
                 >
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <span className="text-xs font-mono font-semibold text-theme-primary">{e.agent_name}</span>
+                      <span className="text-xs font-mono font-semibold text-theme-primary">{e.agent}</span>
                       <span className="text-xs text-theme-muted">{e.action}</span>
                     </div>
                     <div className="flex items-center gap-2 text-xs text-theme-muted">

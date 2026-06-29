@@ -61,7 +61,7 @@ def create_access_token(subject: str, role: str) -> str:
     Returns:
         Encoded JWT access token string.
     """
-    exp = datetime.now(timezone.utc) + timedelta(minutes=15)
+    exp = datetime.now(timezone.utc) + timedelta(hours=8)
     return jwt.encode(
         {"sub": subject, "role": role, "exp": exp, "type": "access"},
         settings.JWT_SECRET_KEY,

@@ -1,4 +1,6 @@
+import { Component, useEffect, useState } from 'react'
 import {BrowserRouter, Navigate, Route, Routes} from 'react-router-dom'
+import axios from 'axios'
 import {useAuthStore} from './store/auth'
 import AppShell from './components/layout/AppShell'
 import Login from './pages/Login'
@@ -18,15 +20,39 @@ import EscalatedAlerts from './pages/EscalatedAlerts'
 import ForgotPassword from './pages/ForgotPassword'
 import ResetPassword from './pages/ResetPassword'
 
-function isTokenValid(token) {
-    if (!token) return false
-    try {
-        const { exp } = JSON.parse(atob(token.split('.')[1]))
-        // exp is in seconds; Date.now() is in milliseconds
-        return exp * 1000 > Date.now()
-    } catch {
-        return false
+class ErrorBoundary extends Component {
+    constructor(props) {
+        super(props)
+        this.state = { hasError: false }
     }
+    static getDerivedStateFromError() {
+        return { hasError: true }
+    }
+    render() {
+        if (this.state.hasError) {
+            return (
+                <div className="min-h-screen bg-theme-base flex items-center justify-center p-4">
+                    <div className="text-center">
+                        <p className="text-red-400 text-sm font-medium mb-2">Something went wrong.</p>
+                        <button
+                            onClick={() => { this.setState({ hasError: false }); window.location.href = '/'; }}
+                            className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                        >
+                            Return to dashboard
+                        </button>
+                    </div>
+                </div>
+            )
+        }
+        return this.props.children
+    }
+}
+
+function tokenExp(token) {
+    try { return JSON.parse(atob(token.split('.')[1])).exp * 1000 } catch { return 0 }
+}
+function isTokenValid(token) {
+    return !!token && tokenExp(token) > Date.now()
 }
 
 function RoleRoute({ children, roles }) {
@@ -35,20 +61,41 @@ function RoleRoute({ children, roles }) {
     return <>{children}</>
 }
 
-function ProtectedRoute({children}){
-    const token = useAuthStore(state => state.accessToken)
-    const clear = useAuthStore(state => state.clear)
+function ProtectedRoute({ children }) {
+    const token    = useAuthStore(state => state.accessToken)
+    const setTokens = useAuthStore(state => state.setTokens)
+    const clear    = useAuthStore(state => state.clear)
+    const [checking, setChecking] = useState(false)
+    const [redirectToLogin, setRedirectToLogin] = useState(false)
 
-    if (!isTokenValid(token)) {
-        // Clear any stale state before redirecting
-        if (token) clear()
-        return <Navigate to="/login" replace />
-    }
+    useEffect(() => {
+        if (!isTokenValid(token)) {
+            // Try to silently refresh before forcing a login
+            setChecking(true)
+            axios.post('/api/auth/refresh', {}, { withCredentials: true })
+                .then(({ data }) => {
+                    try {
+                        const payload = JSON.parse(atob(data.access_token.split('.')[1]))
+                        setTokens(data.access_token, payload.sub, payload.role)
+                    } catch {
+                        clear()
+                        setRedirectToLogin(true)
+                    }
+                })
+                .catch(() => { clear(); setRedirectToLogin(true) })
+                .finally(() => setChecking(false))
+        }
+    }, [token, setTokens, clear])
+
+    if (redirectToLogin) return <Navigate to="/login" replace />
+    if (!isTokenValid(token) && checking) return null   // briefly blank while refreshing
+    if (!isTokenValid(token) && !checking) return <Navigate to="/login" replace />
     return <>{children}</>
 }
 
 export default function App(){
     return(
+        <ErrorBoundary>
         <BrowserRouter>
             <Routes>
                 {/* Public / unauthenticated routes */}
@@ -82,5 +129,6 @@ export default function App(){
                 </Route>
             </Routes>
         </BrowserRouter>
+        </ErrorBoundary>
     )
 }

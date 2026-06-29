@@ -22,7 +22,7 @@ class ConnectionManager:
     
     async def connect(self, channel: str, ws: WebSocket) -> None:
         """Accept a WebSocket connection and register it to a channel.
-        
+
         Args:
             channel: The channel identifier (e.g., 'feed', 'trace:123').
             ws: The WebSocket connection object.
@@ -32,6 +32,21 @@ class ConnectionManager:
             self._channels[channel] = []
         self._channels[channel].append(ws)
         logger.debug(f"WebSocket connected to channel '{channel}'")
+
+    def register(self, channel: str, ws: WebSocket) -> None:
+        """Register an already-accepted WebSocket connection to a channel.
+
+        Use this when the endpoint has already called ws.accept() itself
+        (e.g., for pre-connection authentication).
+
+        Args:
+            channel: The channel identifier.
+            ws: The already-accepted WebSocket connection.
+        """
+        if channel not in self._channels:
+            self._channels[channel] = []
+        self._channels[channel].append(ws)
+        logger.debug(f"WebSocket registered to channel '{channel}'")
     
     def disconnect(self, channel: str, ws: WebSocket) -> None:
         """Remove a WebSocket connection from a channel.

@@ -92,13 +92,19 @@ async def get_incident(alert_id: str) -> Optional[dict]:
     for f in ("src_ip", "dst_ip"):
         if r.get(f):
             r[f] = str(r[f])
-    # Parse plans_generated JSON string to object
-    if r.get("plans_generated"):
-        import json
-        try:
-            r["plans_generated"] = json.loads(r["plans_generated"])
-        except (json.JSONDecodeError, TypeError):
-            pass  # Keep as-is if not valid JSON
+    # asyncpg returns JSONB columns as raw strings — parse them to Python objects
+    for f in ("plans_generated", "cve_matches", "affected_assets"):
+        v = r.get(f)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            try:
+                r[f] = json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                r[f] = [] if f != "plans_generated" else {}
+        # cve_matches and affected_assets must always be lists
+        if f in ("cve_matches", "affected_assets") and not isinstance(r[f], list):
+            r[f] = []
     return r
 
 
@@ -114,6 +120,6 @@ async def upsert_plan_set(alert_id: str, plan_set: dict) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE incidents SET plans_generated=$2::jsonb, approval_status='pending', plans_ready_at=NOW() WHERE alert_id=$1",
+            "UPDATE incidents SET plans_generated=$2::jsonb, approval_status='plans_generated', plans_ready_at=NOW() WHERE alert_id=$1",
             alert_id, json.dumps(plan_set)
         )

@@ -10,6 +10,9 @@ from core.email import email_service
 from db.connection import get_pool
 from db.incidents import get_incident, list_incidents
 from ws.manager import manager
+from confluent_kafka import Producer
+import json
+import os
 
 router = APIRouter()
 
@@ -18,9 +21,18 @@ PRIORITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 # Analysts can only self-assign up to medium priority
 ANALYST_SELF_ASSIGN_MAX_PRIORITY = "medium"
 
+# Kafka configuration
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+INVESTIGATION_TOPIC = "investigation-requests"
+
 
 class AssignRequest(BaseModel):
     analyst_id: Optional[str] = None
+
+
+class InvestigateRequest(BaseModel):
+    """Request to start investigation for an alert."""
+    pass
 
 
 @router.get("")
@@ -91,10 +103,10 @@ async def get_alert_approval(alert_id: str, _: None = Depends(analyst_or_above))
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """SELECT a.id, a.alert_id, a.plan_id, a.decision, a.approved_by,
-                      a.actions, a.notes, a.modifications, a.created_at
+                      a.actions, a.notes, a.modifications, a.decided_at
                FROM approvals a
                WHERE a.alert_id = $1
-               ORDER BY a.created_at DESC
+               ORDER BY a.decided_at DESC
                LIMIT 1""",
             alert_id
         )
@@ -102,8 +114,8 @@ async def get_alert_approval(alert_id: str, _: None = Depends(analyst_or_above))
         raise HTTPException(404, "No approval record found for this alert")
 
     d = dict(row)
-    if d.get("created_at"):
-        d["created_at"] = d["created_at"].isoformat()
+    if d.get("decided_at"):
+        d["decided_at"] = d["decided_at"].isoformat()
     if isinstance(d.get("actions"), str):
         import json as _json
         try:
@@ -234,3 +246,92 @@ async def assign_alert(
         "assigned_to": body.analyst_id,
         "email_sent": target_user is not None and target_user.get("email") is not None
     }
+
+
+@router.post("/{alert_id}/investigate")
+async def start_investigation(
+    alert_id: str,
+    _: None = Depends(analyst_or_above),
+    user: CurrentUser = Depends(get_current_user)
+) -> dict:
+    """Start investigation for an alert.
+    
+    Updates alert status to 'triaged', assigns to current user,
+    and publishes to Kafka to trigger orchestrator investigation.
+    
+    Args:
+        alert_id: The alert ID to investigate.
+        _: Authentication dependency.
+        user: Current authenticated user.
+        
+    Returns:
+        Confirmation message.
+        
+    Raises:
+        HTTPException: 404 if alert not found, 400 if invalid status.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Fetch alert
+        alert = await conn.fetchrow(
+            "SELECT * FROM incidents WHERE alert_id = $1",
+            alert_id
+        )
+        
+        if not alert:
+            raise HTTPException(404, "Alert not found")
+        
+        # Check if alert can be investigated (must be 'received')
+        if alert["approval_status"] != "received":
+            raise HTTPException(
+                400,
+                f"Alert must be in 'received' status to start investigation. Current status: {alert['approval_status']}"
+            )
+        
+        # Update status to triaged and assign to current user
+        await conn.execute(
+            """
+            UPDATE incidents 
+            SET approval_status = 'triaged', 
+                assigned_to = $1, 
+                investigation_started_at = NOW() 
+            WHERE alert_id = $2
+            """,
+            user.username,
+            alert_id
+        )
+        
+        # Publish to Kafka to trigger orchestrator investigation
+        try:
+            producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
+            message = {
+                "alert_id": alert_id,
+                "requested_by": user.username,
+                "timestamp": json.dumps({"$date": {"$numberLong": str(int(__import__('time').time() * 1000))}})
+            }
+            producer.produce(
+                INVESTIGATION_TOPIC,
+                key=alert_id.encode("utf-8"),
+                value=json.dumps(message).encode("utf-8")
+            )
+            producer.flush(timeout=5.0)
+        except Exception as e:
+            # Log error but don't fail the request
+            import logging
+            logging.warning(f"Failed to publish investigation request to Kafka: {e}")
+        
+        # Broadcast WebSocket notification
+        await manager.broadcast("feed", {
+            "type": "investigation_started",
+            "alert_id": alert_id,
+            "started_by": user.username,
+            "classification": alert["classification"],
+            "priority": alert["priority"]
+        })
+        
+        return {
+            "detail": "Investigation started",
+            "alert_id": alert_id,
+            "status": "triaged",
+            "assigned_to": user.username
+        }

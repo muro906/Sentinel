@@ -33,10 +33,11 @@ export default function Login(){
             setTokens(data.access_token, payload.sub, payload.role)
             navigate('/')
         } catch(err){
-            // Normalise error messages — never expose raw server internals to the UI
             const status = err?.response?.status
-            if (status === 401 || status === 403) {
+            if (status === 401) {
                 setError('Invalid username or password.')
+            } else if (status === 403) {
+                setError(err?.response?.data?.detail || 'Account access denied.')
             } else if (status >= 500) {
                 setError('Server error. Please try again later.')
             } else {
@@ -51,7 +52,7 @@ export default function Login(){
         <div className="min-h-screen bg-theme-base flex items-center justify-center p-4">
             <div className="w-full max-w-sm">
                 <div className="flex flex-col items-center mb-8">
-                    <div className="bg-blue-600/20 border border-blie-600/40 rounded-xl p-3 mb-3">
+                    <div className="bg-blue-600/20 border border-blue-600/40 rounded-xl p-3 mb-3">
                         <Shield 
                         size={24}
                         className="text-blue-400" />

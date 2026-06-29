@@ -1,324 +1,291 @@
+"""CVE Lookup Agent — queries NIST NVD API v2.0 in real-time.
+
+Each investigation triggers a live NVD search with service/classification
+keywords. Results are upserted into the local cve_entries table so the
+CVE Browser in the dashboard stays populated as alerts are processed.
+
+Falls back to the local DB if NVD is unreachable.
 """
-CVE Lookup Agent
-=================
-Maps traffic characteristics from the anomaly alert to known CVE exploits.
-
-Process:
-1. EXTRACT SIGNATURES — Analyze the feature vector to determine what kind
-   of attack this looks like and what services are targeted.
-2. BUILD QUERIES — Translate signatures into database search parameters.
-3. SEARCH CVE DATABASE — Run multiple query strategies (full-text, product,
-   attack pattern) and merge results.
-4. SCORE RELEVANCE — Rank matched CVEs by how well they match the observed
-   traffic, weighting CVSS score, exploit availability, and signature match.
-
-The agent emits reasoning events explaining WHY it chose certain search
-strategies and WHY certain CVEs were ranked higher than others.
-"""
-
+import asyncio
 import logging
-from typing import Optional
+import os
+import re
+from typing import Any, Dict, List, Optional
 
-from agentic.agents.base import BaseAgent
-from agentic.db import cve_repository
-from agentic.models.cve import CVEMatch
+import httpx
 
 logger = logging.getLogger(__name__)
 
-# Port → service mapping for signature extraction
-PORT_SERVICE_MAP = {
-    21: "ftp", 22: "openssh", 23: "telnet", 25: "smtp",
-    53: "bind", 80: "http", 110: "pop3", 143: "imap",
-    443: "https", 445: "smb", 993: "imaps", 995: "pop3s",
-    1433: "mssql", 1521: "oracle", 3306: "mysql",
-    3389: "rdp", 5432: "postgresql", 5900: "vnc",
-    6379: "redis", 8080: "http", 8443: "https",
-    9200: "elasticsearch", 27017: "mongodb",
+NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+# Port → canonical service keyword for NVD keyword search
+_PORT_SERVICE = {
+    21: "ftp",        22: "ssh",       23: "telnet",
+    25: "smtp",       53: "dns",       80: "http",
+    110: "pop3",      143: "imap",     389: "ldap",
+    443: "https ssl", 445: "smb",      1433: "mssql",
+    3306: "mysql",    3389: "rdp remote desktop",
+    5432: "postgresql", 5900: "vnc",  6379: "redis",
+    8080: "http",     8443: "https",  27017: "mongodb",
 }
 
-# Connection states indicating attack patterns
-SCAN_STATES = {"S0", "REJ", "RSTOS0", "RSTRH"}
-EXPLOIT_STATES = {"RSTO", "S1", "SH"}
+# Fragments inside classification strings that map to better NVD search terms
+_CLASS_KEYWORDS = {
+    "log4shell":    "log4j log4shell",
+    "log4j":        "log4j",
+    "eternalblue":  "eternalblue smb windows",
+    "bluekeep":     "bluekeep rdp cve-2019-0708",
+    "heartbleed":   "heartbleed openssl",
+    "shellshock":   "shellshock bash",
+    "wannacry":     "wannacry smb ransomware",
+    "sql_inject":   "sql injection",
+    "exfiltrat":    "data exfiltration",
+    "brute_force":  "brute force authentication",
+    "portscan":     "port scan reconnaissance",
+    "smb":          "smb windows",
+    "ssh":          "ssh openssh",
+    "rdp":          "rdp remote desktop",
+    "http":         "http web",
+    "dns":          "dns",
+    "ftp":          "ftp",
+    "mysql":        "mysql database",
+    "redis":        "redis",
+    "mongodb":      "mongodb",
+}
 
 
-class CVELookupAgent(BaseAgent):
-    """
-    Sub-agent that searches the CVE database for exploits matching
-    the traffic characteristics of an anomaly alert.
-    """
+def _extract_keywords(service: Optional[str], classification: str, dst_port: int) -> str:
+    """Derive compact NVD search keywords from alert metadata."""
+    parts: List[str] = []
 
-    @property
-    def name(self) -> str:
-        return "cve_lookup"
+    # 1. explicit service hint
+    if service and service not in ("-", ""):
+        parts.append(service)
 
-    async def _process(self, task_data: dict) -> dict:
+    # 2. port-derived service
+    port_svc = _PORT_SERVICE.get(dst_port, "")
+    if port_svc and port_svc not in " ".join(parts):
+        parts.append(port_svc)
+
+    # 3. classification fragments
+    cls_lower = classification.lower()
+    for fragment, keyword in _CLASS_KEYWORDS.items():
+        if fragment in cls_lower:
+            for kw in keyword.split():
+                if kw not in " ".join(parts):
+                    parts.append(kw)
+            break  # one match is enough
+
+    return " ".join(parts[:6]) or classification.replace("_", " ")
+
+
+def _parse_nvd_vuln(vuln: dict) -> Optional[Dict[str, Any]]:
+    """Parse a single NVD vulnerability object into our cve_entries schema."""
+    cve = vuln.get("cve", {})
+    cve_id = cve.get("id", "")
+    if not cve_id:
+        return None
+
+    # English description
+    description = next(
+        (d["value"] for d in cve.get("descriptions", []) if d.get("lang") == "en"),
+        ""
+    )
+
+    # CVSS v3.x metrics (prefer v3.1, fall back to v3.0)
+    metrics = cve.get("metrics", {})
+    cvss_data = None
+    for key in ("cvssMetricV31", "cvssMetricV30"):
+        entries = metrics.get(key, [])
+        # prefer Primary source
+        primary = next((e for e in entries if e.get("type") == "Primary"), None)
+        cvss_data = (primary or (entries[0] if entries else None))
+        if cvss_data:
+            cvss_data = cvss_data.get("cvssData", {})
+            break
+
+    score = cvss_data.get("baseScore") if cvss_data else None
+    vector = cvss_data.get("vectorString") if cvss_data else None
+    severity = (cvss_data.get("baseSeverity") if cvss_data else None) or _score_to_severity(score)
+    attack_vector = cvss_data.get("attackVector") if cvss_data else None
+    attack_complexity = cvss_data.get("attackComplexity") if cvss_data else None
+    privileges_required = cvss_data.get("privilegesRequired") if cvss_data else None
+    user_interaction = cvss_data.get("userInteraction") if cvss_data else None
+
+    # Affected product from CPE
+    affected_vendor = affected_product = affected_versions = None
+    for config in cve.get("configurations", []):
+        for node in config.get("nodes", []):
+            for match in node.get("cpeMatch", []):
+                parts = match.get("criteria", "").split(":")
+                if len(parts) >= 5:
+                    affected_vendor  = parts[3] if parts[3] != "*" else None
+                    affected_product = parts[4] if parts[4] != "*" else None
+                    vs = match.get("versionStartIncluding", "")
+                    ve = match.get("versionEndExcluding", "")
+                    if vs or ve:
+                        affected_versions = f"{vs} - {ve}".strip(" -")
+                    break
+            if affected_vendor:
+                break
+        if affected_vendor:
+            break
+
+    # Exploit available: check NVD reference tags
+    exploit_available = any(
+        "Exploit" in ref.get("tags", [])
+        for ref in cve.get("references", [])
+    )
+
+    return {
+        "cve_id":              cve_id,
+        "description":         description,
+        "cvss_v3_score":       score,
+        "cvss_v3_vector":      vector,
+        "severity":            severity,
+        "published_date":      cve.get("published"),
+        "modified_date":       cve.get("lastModified"),
+        "affected_vendor":     affected_vendor,
+        "affected_product":    affected_product,
+        "affected_versions":   affected_versions,
+        "attack_vector":       attack_vector,
+        "attack_complexity":   attack_complexity,
+        "privileges_required": privileges_required,
+        "user_interaction":    user_interaction,
+        "exploit_available":   exploit_available,
+    }
+
+
+def _score_to_severity(score: Optional[float]) -> Optional[str]:
+    if score is None:
+        return None
+    if score >= 9.0:
+        return "CRITICAL"
+    if score >= 7.0:
+        return "HIGH"
+    if score >= 4.0:
+        return "MEDIUM"
+    return "LOW"
+
+
+async def _upsert_to_db(cves: List[Dict[str, Any]]) -> None:
+    """Write NVD results into cve_entries so the CVE Browser shows them."""
+    if not cves:
+        return
+    try:
+        import asyncpg
+        conn = await asyncpg.connect(
+            os.getenv("DATABASE_URL", "postgresql://sentinel:sentinel@localhost:5432/sentinel")
+        )
+        try:
+            for c in cves:
+                await conn.execute(
+                    """
+                    INSERT INTO cve_entries (
+                        cve_id, description, cvss_v3_score, cvss_v3_vector, severity,
+                        published_date, modified_date, affected_vendor, affected_product,
+                        affected_versions, attack_vector, attack_complexity,
+                        privileges_required, user_interaction, exploit_available
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                    ON CONFLICT (cve_id) DO UPDATE SET
+                        description        = EXCLUDED.description,
+                        cvss_v3_score      = EXCLUDED.cvss_v3_score,
+                        severity           = EXCLUDED.severity,
+                        modified_date      = EXCLUDED.modified_date,
+                        exploit_available  = EXCLUDED.exploit_available
+                    """,
+                    c["cve_id"], c["description"], c["cvss_v3_score"], c["cvss_v3_vector"],
+                    c["severity"], c["published_date"], c["modified_date"],
+                    c["affected_vendor"], c["affected_product"], c["affected_versions"],
+                    c["attack_vector"], c["attack_complexity"],
+                    c["privileges_required"], c["user_interaction"], c["exploit_available"],
+                )
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.warning("CVE upsert to local DB failed: %s", exc)
+
+
+async def _query_local_db(service: str, classification: str) -> List[Dict[str, Any]]:
+    """Fallback: search the local cve_entries table."""
+    try:
+        import asyncpg
+        conn = await asyncpg.connect(
+            os.getenv("DATABASE_URL", "postgresql://sentinel:sentinel@localhost:5432/sentinel")
+        )
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT cve_id, cvss_v3_score, severity, description,
+                       affected_product, affected_versions, exploit_available
+                FROM cve_entries
+                WHERE affected_product ILIKE $1 OR description ILIKE $2
+                ORDER BY cvss_v3_score DESC NULLS LAST
+                LIMIT 5
+                """,
+                f"%{service}%",
+                f"%{classification.replace('_', ' ')}%",
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+    except Exception as exc:
+        logger.warning("Local CVE DB query failed: %s", exc)
+        return []
+
+
+class CVELookupAgent:
+    """Queries NIST NVD API for CVEs relevant to the alert's service/classification."""
+
+    async def lookup(
+        self,
+        dst_port: int,
+        service: Optional[str],
+        classification: str,
+    ) -> List[Dict[str, Any]]:
+        keyword = _extract_keywords(service, classification, dst_port)
+        logger.info("CVE NVD search: '%s' (port=%d, service=%s)", keyword, dst_port, service)
+
+        try:
+            results = await self._query_nvd(keyword)
+        except Exception as exc:
+            logger.warning("NVD API unavailable (%s), using local DB", exc)
+            results = []
+
+        if results:
+            # Persist to local DB so the CVE Browser reflects real data
+            asyncio.create_task(_upsert_to_db(results))
+            logger.info("Found %d CVEs from NVD for '%s'", len(results), keyword)
+            return results
+
+        # NVD returned nothing or failed — fall back to local seed data
+        logger.info("Falling back to local CVE DB for '%s'", keyword)
+        svc = service or _PORT_SERVICE.get(dst_port, "")
+        return await _query_local_db(svc, classification)
+
+    async def _query_nvd(self, keyword: str, limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Core CVE lookup logic.
-
-        Input (task_data keys):
-            - dst_port: target port
-            - proto: protocol (tcp/udp)
-            - conn_state: connection state (S0, SF, REJ, etc.)
-            - service: zeek-identified service (if any)
-            - classification: attack classification from detection layer
-            - ssl_version: TLS version (if applicable)
-            - dns_query: DNS query (if applicable)
-            - bytes_ratio: traffic ratio
-            - src_ip, dst_ip: involved IPs
-
-        Output:
-            - matches: list of CVEMatch dicts
-            - signatures: extracted signatures
-            - _confidence: overall confidence in matches
+        Query NVD API v2.0 with keyword search.
+        NVD rate limit: 5 req/30 s (no key) — each investigation makes one call.
         """
-        # Step 1: Extract signatures from traffic features
-        signatures = self._extract_signatures(task_data)
-
-        # Step 2: Build and execute queries based on signatures
-        all_matches = []
-
-        for sig in signatures:
-            matches = await self._query_for_signature(sig)
-            all_matches.extend(matches)
-
-        # Step 3: Deduplicate and score
-        scored_matches = self._score_and_deduplicate(all_matches, task_data)
-
-        # Step 4: Build result
-        top_matches = scored_matches[:5]  # return top 5
-
-        return {
-            "matches": [m.model_dump() for m in top_matches],
-            "signatures": signatures,
-            "total_candidates": len(all_matches),
-            "top_match": top_matches[0].model_dump() if top_matches else None,
-            "_confidence": top_matches[0].match_confidence if top_matches else 0.0,
+        api_key = os.getenv("NVD_API_KEY")
+        headers = {"apiKey": api_key} if api_key else {}
+        params = {
+            "keywordSearch":  keyword,
+            "resultsPerPage": limit * 3,   # fetch more, then take top by CVSS
         }
 
-    def _extract_signatures(self, task_data: dict) -> list[dict]:
-        """
-        Analyze traffic features and extract searchable signatures.
-        Each signature represents a hypothesis about what exploit/vulnerability
-        the traffic might be targeting.
-        """
-        signatures = []
-        dst_port = task_data.get("dst_port")
-        conn_state = task_data.get("conn_state", "")
-        classification = task_data.get("classification", "")
-        ssl_version = task_data.get("ssl_version")
-        dns_query = task_data.get("dns_query")
-        proto = task_data.get("proto", "tcp")
-        service = task_data.get("service")
-        bytes_ratio = task_data.get("bytes_ratio", 0)
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(NVD_API_URL, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
 
-        # Signature 1: Port → specific service vulnerability
-        if dst_port:
-            target_service = service or PORT_SERVICE_MAP.get(dst_port)
-            if target_service:
-                signatures.append({
-                    "type": "service_vuln",
-                    "service": target_service,
-                    "port": dst_port,
-                    "keywords": [target_service],
-                    "rationale": f"Target port {dst_port} maps to service '{target_service}'"
-                })
+        parsed = []
+        for vuln in data.get("vulnerabilities", []):
+            rec = _parse_nvd_vuln(vuln)
+            if rec and rec["cvss_v3_score"] is not None:
+                parsed.append(rec)
 
-        # Signature 2: Connection state → attack pattern
-        if conn_state in SCAN_STATES:
-            signatures.append({
-                "type": "reconnaissance",
-                "attack_pattern": "port_scan" if conn_state == "S0" else "connection_probe",
-                "keywords": ["scan", "reconnaissance", "enumeration"],
-                "attack_vector": "NETWORK",
-                "privileges_required": "NONE",
-                "rationale": f"Connection state '{conn_state}' indicates reconnaissance "
-                             f"(SYN sent, no response/rejected)"
-            })
-
-        if conn_state in EXPLOIT_STATES:
-            signatures.append({
-                "type": "exploit_attempt",
-                "attack_pattern": "exploit",
-                "keywords": ["remote code execution", "buffer overflow", "pre-auth"],
-                "attack_vector": "NETWORK",
-                "min_cvss": 7.0,
-                "rationale": f"Connection state '{conn_state}' suggests active exploit attempt "
-                             f"(connection established then abnormally terminated)"
-            })
-
-        # Signature 3: SSL/TLS vulnerability
-        if ssl_version and ssl_version in ("SSLv3", "TLSv10", "TLSv1"):
-            signatures.append({
-                "type": "weak_tls",
-                "keywords": [ssl_version.lower(), "ssl", "tls", "downgrade"],
-                "rationale": f"Deprecated TLS version '{ssl_version}' in use — "
-                             f"known vulnerabilities (POODLE, BEAST, etc.)"
-            })
-
-        # Signature 4: DNS-based attack
-        if dns_query or classification == "dns_tunneling":
-            signatures.append({
-                "type": "dns_attack",
-                "keywords": ["dns", "tunneling", "exfiltration", "dga"],
-                "rationale": "DNS-based anomaly detected — possible tunneling or DGA communication"
-            })
-
-        # Signature 5: Data exfiltration pattern
-        if classification == "data_exfiltration" or (bytes_ratio and bytes_ratio > 5.0):
-            signatures.append({
-                "type": "exfiltration",
-                "keywords": ["exfiltration", "data theft", "command and control", "c2"],
-                "rationale": f"High outbound byte ratio ({bytes_ratio:.1f}) suggests data exfiltration"
-            })
-
-        # Fallback: if no specific signatures, search by classification
-        if not signatures and classification:
-            signatures.append({
-                "type": "generic",
-                "keywords": classification.replace("_", " ").split(),
-                "attack_vector": "NETWORK",
-                "rationale": f"Generic search based on classification '{classification}'"
-            })
-
-        return signatures
-
-    async def _query_for_signature(self, signature: dict) -> list[dict]:
-        """Execute appropriate database queries for a given signature."""
-        matches = []
-        sig_type = signature.get("type", "generic")
-
-        if sig_type == "service_vuln":
-            # Search by product name
-            results = await cve_repository.search_by_product(
-                product=signature["service"],
-                min_cvss=4.0,
-                limit=5,
-            )
-            for r in results:
-                r["_matched_signature"] = f"dst_port={signature.get('port')}, service={signature['service']}"
-                r["_sig_type"] = sig_type
-            matches.extend(results)
-
-        if sig_type in ("reconnaissance", "exploit_attempt"):
-            # Search by attack pattern
-            results = await cve_repository.search_by_attack_pattern(
-                attack_vector=signature.get("attack_vector", "NETWORK"),
-                privileges_required=signature.get("privileges_required", "NONE"),
-                min_cvss=signature.get("min_cvss", 6.0),
-                limit=5,
-            )
-            for r in results:
-                r["_matched_signature"] = f"attack_pattern={signature.get('attack_pattern')}"
-                r["_sig_type"] = sig_type
-            matches.extend(results)
-
-        # Always do keyword search
-        if signature.get("keywords"):
-            results = await cve_repository.search_by_keywords(
-                keywords=signature["keywords"],
-                min_cvss=4.0,
-                attack_vector=signature.get("attack_vector"),
-                limit=5,
-            )
-            for r in results:
-                r["_matched_signature"] = f"keywords={signature['keywords']}"
-                r["_sig_type"] = sig_type
-            matches.extend(results)
-
-        return matches
-
-    def _score_and_deduplicate(self, raw_matches: list[dict], task_data: dict) -> list[CVEMatch]:
-        """
-        Score and deduplicate CVE matches. Scoring formula:
-            confidence = (cvss_weight * 0.4) + (exploit_bonus * 0.3) + (signature_match * 0.3)
-        """
-        seen_cves = {}
-
-        for match in raw_matches:
-            cve_id = match.get("cve_id")
-            if not cve_id:
-                continue
-
-            # Calculate confidence score
-            cvss = match.get("cvss_v3_score") or 0.0
-            cvss_weight = min(cvss / 10.0, 1.0)
-
-            exploit_bonus = 0.8 if match.get("exploit_available") else 0.2
-            sig_type = match.get("_sig_type", "generic")
-            sig_match = {"service_vuln": 0.9, "exploit_attempt": 0.8,
-                         "reconnaissance": 0.6, "weak_tls": 0.9,
-                         "dns_attack": 0.7, "exfiltration": 0.6}.get(sig_type, 0.4)
-
-            confidence = (cvss_weight * 0.4) + (exploit_bonus * 0.3) + (sig_match * 0.3)
-
-            # Keep highest confidence per CVE
-            if cve_id not in seen_cves or confidence > seen_cves[cve_id].match_confidence:
-                seen_cves[cve_id] = CVEMatch(
-                    cve_id=cve_id,
-                    cvss_score=cvss,
-                    severity=match.get("severity", "UNKNOWN"),
-                    description=match.get("description", "")[:500],
-                    affected_product=match.get("affected_product"),
-                    affected_versions=match.get("affected_versions"),
-                    exploit_available=match.get("exploit_available", False),
-                    matched_signature=match.get("_matched_signature", "unknown"),
-                    match_confidence=round(confidence, 3),
-                    match_rationale=self._build_rationale(match, confidence),
-                )
-
-        # Sort by confidence descending
-        sorted_matches = sorted(seen_cves.values(), key=lambda m: m.match_confidence, reverse=True)
-        return sorted_matches
-
-    def _build_rationale(self, match: dict, confidence: float) -> str:
-        """Build a human-readable rationale for why this CVE was matched."""
-        parts = [f"Matched via {match.get('_matched_signature', 'keyword search')}."]
-
-        cvss = match.get("cvss_v3_score")
-        if cvss:
-            parts.append(f"CVSS {cvss}/10 ({match.get('severity', 'N/A')}).")
-
-        if match.get("exploit_available"):
-            parts.append("Known exploit exists in the wild.")
-
-        if match.get("affected_product"):
-            parts.append(f"Affects {match['affected_product']}")
-            if match.get("affected_versions"):
-                parts.append(f"versions {match['affected_versions']}.")
-            else:
-                parts.append("(version unspecified).")
-
-        parts.append(f"Match confidence: {confidence:.0%}.")
-        return " ".join(parts)
-
-    def _summarize_output(self, result: dict) -> str:
-        """Human-readable summary for the reasoning trace."""
-        matches = result.get("matches", [])
-        if not matches:
-            return "No CVE matches found"
-        top = matches[0]
-        return (
-            f"Found {len(matches)} CVEs. Top: {top['cve_id']} "
-            f"(cvss={top['cvss_score']}, confidence={top['match_confidence']:.0%})"
-        )
-
-    def _explain_result(self, result: dict) -> str:
-        """Detailed rationale for the reasoning trace."""
-        sigs = result.get("signatures", [])
-        matches = result.get("matches", [])
-        total = result.get("total_candidates", 0)
-
-        parts = [f"Extracted {len(sigs)} signatures from traffic features."]
-        for sig in sigs:
-            parts.append(f"  - {sig.get('type')}: {sig.get('rationale', '')}")
-
-        parts.append(f"Searched CVE database: {total} candidates found, {len(matches)} after scoring.")
-
-        if matches:
-            top = matches[0]
-            parts.append(
-                f"Top match: {top['cve_id']} ({top['severity']}, cvss={top['cvss_score']}) — "
-                f"{top['match_rationale']}"
-            )
-
-        return "\n".join(parts)
+        # Return top entries by CVSS score
+        parsed.sort(key=lambda r: r["cvss_v3_score"] or 0, reverse=True)
+        return parsed[:limit]

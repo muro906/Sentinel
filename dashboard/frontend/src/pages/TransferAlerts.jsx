@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowRightLeft, CheckCircle, XCircle, Clock, ChevronRight,
-  RefreshCw, Filter, User, AlertCircle, X
+  RefreshCw, User, AlertCircle, X, Search
 } from 'lucide-react'
 import api from '../lib/api'
 import { Badge } from '../components/ui/Badge'
@@ -12,7 +12,6 @@ import { timeAgo, cn } from '../lib/utils'
 import { useAuthStore } from '../store/auth'
 import { useToastStore } from '../components/ui/Toast'
 import { useWebSocket } from '../hooks/useWebSocket'
-import { useQueryClient as useQC } from '@tanstack/react-query'
 
 // ── Data hooks ────────────────────────────────────────────────────────────────
 
@@ -238,6 +237,7 @@ export default function TransferAlerts() {
   const qc = useQueryClient()
 
   const [statusFilter, setStatusFilter] = useState('')
+  const [search, setSearch] = useState('')
   const [showNewDialog, setShowNewDialog] = useState(false)
 
   const { data, isLoading, refetch, isFetching } = useTransfers(statusFilter)
@@ -263,9 +263,18 @@ export default function TransferAlerts() {
 
   if (isLoading) return <PageSpinner />
 
-  const transfers = data?.items ?? []
+  const searchLower = search.trim().toLowerCase()
+  const transfers = (data?.items ?? []).filter(t => {
+    if (!searchLower) return true
+    return (
+      t.classification?.toLowerCase().includes(searchLower) ||
+      t.alert_id?.toLowerCase().includes(searchLower) ||
+      t.from_user?.toLowerCase().includes(searchLower) ||
+      t.to_user?.toLowerCase().includes(searchLower) ||
+      t.reason?.toLowerCase().includes(searchLower)
+    )
+  })
   const incoming = transfers.filter(t => t.to_user === username && t.status === 'pending')
-  const outgoing = transfers.filter(t => t.from_user === username && t.status === 'pending')
 
   return (
     <div className="space-y-5">
@@ -284,6 +293,16 @@ export default function TransferAlerts() {
           <p className="text-xs text-theme-muted mt-0.5">Peer-to-peer alert handoff requests</p>
         </div>
         <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search size={12} className="absolute left-2.5 top-2 text-theme-muted" />
+            <input
+              type="text"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search classification, user…"
+              className="bg-theme-raised border border-theme text-xs text-theme-primary rounded pl-7 pr-3 py-1.5 focus:outline-none focus:border-blue-500 w-48"
+            />
+          </div>
           <select
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value)}
@@ -370,10 +389,14 @@ export default function TransferAlerts() {
                 <td colSpan={8}>
                   <div className="flex flex-col items-center justify-center py-16 gap-2">
                     <ArrowRightLeft size={28} className="text-theme-muted opacity-30" />
-                    <p className="text-sm text-theme-muted">No transfer requests yet</p>
-                    <p className="text-xs text-theme-muted opacity-60">
-                      Use "New Transfer" to handoff an alert to a colleague
+                    <p className="text-sm text-theme-muted">
+                      {search.trim() ? 'No transfers match your search' : 'No transfer requests yet'}
                     </p>
+                    {!search.trim() && (
+                      <p className="text-xs text-theme-muted opacity-60">
+                        Use "New Transfer" to handoff an alert to a colleague
+                      </p>
+                    )}
                   </div>
                 </td>
               </tr>
@@ -407,7 +430,7 @@ export default function TransferAlerts() {
                       {t.to_user === username && <span className="text-theme-muted">(you)</span>}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-theme-muted max-w-[200px]">
+                  <td className="px-4 py-3 text-theme-muted max-w-50">
                     <span className="truncate block" title={t.reason}>{t.reason}</span>
                   </td>
                   <td className="px-4 py-3">

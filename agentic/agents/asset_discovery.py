@@ -1,236 +1,213 @@
+"""Asset Discovery Agent — network reconnaissance for a given alert.
+
+For each alert the agent concurrently:
+  1. Pings the destination IP to test reachability
+  2. Resolves its hostname via nslookup
+  3. Queries WHOIS for ownership information
+  4. Looks the IP up in the local asset inventory (PostgreSQL)
+  5. Runs a fast nmap scan to enumerate open ports
+  6. Counts active TCP connections from the source IP via ss
+
+All six probes run in parallel with asyncio.gather; individual failures are
+silently swallowed so a single unreachable probe cannot block the pipeline.
 """
-Asset Discovery Agent
-======================
-Resolves IPs from an anomaly alert to concrete assets in the inventory,
-enriches with service and network zone information, and calculates the
-blast radius (potential impact if the asset is compromised).
-
-Process:
-1. RESOLVE — Look up src_ip and dst_ip in the asset database
-2. ENRICH — For each resolved asset, fetch running services, network zone,
-   and downstream dependencies
-3. ASSESS IMPACT — Calculate blast radius using:
-   blast_radius = criticality × (1 + critical_dependents) × zone_exposure_factor
-
-The blast radius tells the Planning Agent how severe the potential impact is,
-which directly influences plan aggression and confidence scoring.
-"""
-
+import asyncio
 import logging
-from typing import Optional
+import os
+from typing import Optional, Dict, Any, List
 
-from agentic.agents.base import BaseAgent
-from agentic.db import asset_repository
-from agentic.models.asset import AssetInfo, ServiceInfo, NetworkZone, AssetDependency
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
-# Zone trust level → exposure factor (lower trust = higher exposure)
-ZONE_EXPOSURE_FACTORS = {
-    1: 2.0,   # untrusted (public-facing) — maximum exposure
-    2: 1.5,   # semi-trusted (DMZ)
-    3: 1.0,   # trusted (internal)
-    4: 0.7,   # highly trusted (management)
-    5: 0.5,   # restricted (secrets)
-}
+_DB_URL = os.getenv("DATABASE_URL", "postgresql://sentinel:sentinel@localhost:5432/sentinel")
+
+# RFC-1918 + loopback prefixes used to classify source IPs as internal.
+# str.startswith() accepts a tuple directly, so this is used as-is in _assess_source.
+_PRIVATE_PREFIXES = (
+    "10.", "127.", "192.168.",
+    *[f"172.{i}." for i in range(16, 32)],
+)
+
+# WHOIS field names that carry the owning organisation, in priority order.
+_WHOIS_FIELDS = ("orgname:", "org-name:", "organization:", "netname:")
+
+# Lazy asyncpg pool — shared across all discover() calls in this process.
+_pool: asyncpg.Pool | None = None
 
 
-class AssetDiscoveryAgent(BaseAgent):
+async def _get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(_DB_URL, min_size=1, max_size=5)
+    return _pool
+
+
+def _safe(v: Any, default: Any) -> Any:
+    """Return default if v is an Exception, otherwise return v as-is.
+
+    Used after asyncio.gather(return_exceptions=True) to replace failed
+    sub-task results with harmless defaults without raising.
     """
-    Sub-agent that resolves IPs to assets, enriches with context,
-    and calculates blast radius for impact assessment.
-    """
+    return default if isinstance(v, Exception) else v
 
-    @property
-    def name(self) -> str:
-        return "asset_discovery"
 
-    async def _process(self, task_data: dict) -> dict:
+class AssetDiscoveryAgent:
+
+    async def discover(self, src_ip: str, dst_ip: str, dst_port: int) -> Dict[str, Any]:
+        """Run all six reconnaissance probes concurrently and merge their results.
+
+        Returns a dict with keys:
+          dst_reachable, dst_hostname, dst_ownership, open_ports,
+          local_asset, active_connections, source_assessment
         """
-        Core asset discovery logic.
+        src_ip, dst_ip = str(src_ip), str(dst_ip)
 
-        Input (task_data keys):
-            - src_ip: source IP from the alert
-            - dst_ip: destination IP from the alert
-            - dst_port: target port (for service matching)
-            - classification: attack type
+        # Launch all probes at once; individual failures are captured as Exception
+        # instances rather than propagating, so one slow/broken probe cannot block the rest.
+        (reachable, hostname, ownership,
+         local_asset, open_ports, active_conns) = await asyncio.gather(
+            self._ping(dst_ip),
+            self._nslookup(dst_ip),
+            self._whois(dst_ip),
+            self._check_local_asset_db(dst_ip),
+            self._nmap_scan(dst_ip),
+            self._active_connections(src_ip),
+            return_exceptions=True,
+        )
 
-        Output:
-            - affected_assets: list of AssetInfo dicts
-            - source_context: context about the source (attacker)
-            - target_context: context about the target (victim)
-            - _confidence: confidence in the resolution
-        """
-        src_ip = task_data.get("src_ip")
-        dst_ip = task_data.get("dst_ip")
-        dst_port = task_data.get("dst_port")
-
-        affected_assets = []
-        source_context = None
-        target_context = None
-
-        # Resolve destination IP (the target/victim)
-        if dst_ip:
-            target_asset = await self._resolve_and_enrich(dst_ip)
-            if target_asset:
-                target_context = target_asset.model_dump()
-                affected_assets.append(target_asset.model_dump())
-
-        # Resolve source IP (may be internal compromised host)
-        if src_ip:
-            source_asset = await self._resolve_and_enrich(src_ip)
-            if source_asset:
-                source_context = source_asset.model_dump()
-                # Only add to affected if it's an internal asset (possibly compromised)
-                if source_asset.network_zone and source_asset.network_zone.trust_level >= 2:
-                    affected_assets.append(source_asset.model_dump())
-            else:
-                # Source not in inventory — determine its zone for context
-                source_zone = await asset_repository.find_zone_for_ip(src_ip)
-                source_context = {
-                    "ip_address": src_ip,
-                    "hostname": None,
-                    "known_asset": False,
-                    "zone": source_zone,
-                    "assessment": "External/unknown source — likely attacker"
-                                  if not source_zone or source_zone.get("trust_level", 0) <= 1
-                                  else "Internal asset not in inventory — possible shadow IT"
-                }
-
-        # Calculate overall confidence
-        confidence = 0.0
-        if target_context and isinstance(target_context, dict) and target_context.get("hostname"):
-            confidence = 0.9  # high confidence — known asset
-        elif target_context:
-            confidence = 0.5  # partial — zone identified but asset unknown
-        else:
-            confidence = 0.3  # low — nothing resolved
-
-        return {
-            "affected_assets": affected_assets,
-            "source_context": source_context,
-            "target_context": target_context,
-            "total_blast_radius": sum(
-                a.get("blast_radius", 0) for a in affected_assets
-            ),
-            "_confidence": confidence,
+        result = {
+            "dst_reachable":      _safe(reachable, None),
+            "dst_hostname":       _safe(hostname, None),
+            "dst_ownership":      _safe(ownership, None),
+            "open_ports":         _safe(open_ports, []),
+            "local_asset":        _safe(local_asset, None),
+            "active_connections": _safe(active_conns, 0),
+            # Derived synchronously from the source IP — no I/O needed.
+            "source_assessment":  self._assess_source(src_ip),
         }
+        logger.info(
+            "Asset discovery done for %s: reachable=%s open_ports=%s",
+            dst_ip, result["dst_reachable"], result["open_ports"],
+        )
+        return result
 
-    async def _resolve_and_enrich(self, ip_address: str) -> Optional[AssetInfo]:
-        """
-        Resolve an IP to a full AssetInfo with services, zone, and blast radius.
-        Returns None if the IP is not in the asset inventory.
-        """
-        # Step 1: Find the asset
-        asset_record = await asset_repository.find_asset_by_ip(ip_address)
-        if not asset_record:
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    async def _ping(self, ip: str) -> bool:
+        """Return True if the host responds to a single ICMP echo within 2 s."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ping", "-c", "1", "-W", "2", ip,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=4)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    async def _nslookup(self, ip: str) -> Optional[str]:
+        """Reverse-resolve ip to a hostname; returns None if resolution fails."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nslookup", ip,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=6)
+            for line in stdout.decode().splitlines():
+                if "name =" in line.lower():
+                    return line.split("=", 1)[1].strip().rstrip(".")
+            return None
+        except Exception:
             return None
 
-        asset_id = asset_record["id"]
-
-        # Step 2: Fetch running services
-        service_records = await asset_repository.get_services_for_asset(asset_id)
-        services = [
-            ServiceInfo(
-                port=s["port"],
-                protocol=s["protocol"],
-                service_name=s["service_name"],
-                version=s.get("version"),
-                is_exposed=s.get("is_exposed", False),
+    async def _whois(self, ip: str) -> Optional[str]:
+        """Return the owning organisation name from WHOIS output, or None."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "whois", ip,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            for s in service_records
-        ]
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=12)
+            # Lowercase each line once to avoid repeated .lower() in the inner check.
+            for line in stdout.decode().splitlines():
+                line_lower = line.lower()
+                for field in _WHOIS_FIELDS:
+                    if line_lower.startswith(field):
+                        return line.split(":", 1)[1].strip()
+            return None
+        except Exception:
+            return None
 
-        # Step 3: Build network zone
-        network_zone = None
-        if asset_record.get("zone_name"):
-            network_zone = NetworkZone(
-                zone_name=asset_record["zone_name"],
-                subnet=str(asset_record.get("subnet", "")),
-                vlan_id=asset_record.get("vlan_id"),
-                trust_level=asset_record.get("trust_level", 3),
+    async def _nmap_scan(self, ip: str) -> List[int]:
+        """Fast nmap scan (-F top-100 ports); returns list of open port numbers.
+
+        Uses grepable output (-oG -) because it's cheaper to parse than XML
+        and doesn't require a temporary file.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nmap", "-F", "--open", "-oG", "-", ip,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            ports: List[int] = []
+            for line in stdout.decode().splitlines():
+                if "Ports:" not in line:
+                    continue
+                # Each chunk looks like "22/open/tcp//ssh///" — extract the port number.
+                for chunk in line.split("Ports:", 1)[1].split(","):
+                    chunk = chunk.strip()
+                    if "/open/" in chunk:
+                        try:
+                            ports.append(int(chunk.split("/")[0]))
+                        except ValueError:
+                            pass
+            return ports
+        except Exception:
+            return []
 
-        # Step 4: Fetch downstream dependents (for blast radius)
-        dependents_raw = await asset_repository.get_downstream_dependents(asset_id)
-        dependents = [
-            AssetDependency(
-                hostname=d["hostname"],
-                dependency_type=d["dependency_type"],
-                is_critical=d.get("is_critical", False),
+    async def _active_connections(self, src_ip: str) -> int:
+        """Count established TCP connections that involve src_ip using ss."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ss", "-tn",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
             )
-            for d in dependents_raw
-        ]
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            return sum(1 for line in stdout.decode().splitlines() if src_ip in line)
+        except Exception:
+            return 0
 
-        # Step 5: Calculate blast radius
-        criticality = asset_record.get("criticality_tier", 5)
-        critical_deps = sum(1 for d in dependents if d.is_critical)
-        zone_trust = network_zone.trust_level if network_zone else 3
-        zone_exposure = ZONE_EXPOSURE_FACTORS.get(zone_trust, 1.0)
+    async def _check_local_asset_db(self, ip: str) -> Optional[Dict[str, Any]]:
+        """Look up ip in the asset inventory; returns a dict row or None.
 
-        blast_radius = round(
-            (6 - criticality) * (1 + critical_deps) * zone_exposure, 2
-        )
-        # (6 - criticality) inverts the scale: tier 1 → factor 5, tier 5 → factor 1
-
-        # Build complete AssetInfo
-        return AssetInfo(
-            hostname=asset_record["hostname"],
-            ip_address=ip_address,
-            os=asset_record.get("os"),
-            os_version=asset_record.get("os_version"),
-            owner=asset_record.get("owner"),
-            department=asset_record.get("department"),
-            criticality_tier=criticality,
-            asset_type=asset_record.get("asset_type"),
-            network_zone=network_zone,
-            services=services,
-            downstream_dependents=dependents,
-            blast_radius=blast_radius,
-        )
-
-    def _summarize_output(self, result: dict) -> str:
-        """Human-readable summary for reasoning trace."""
-        assets = result.get("affected_assets", [])
-        if not assets:
-            return "No known assets resolved from IPs"
-        names = [a.get("hostname", a.get("ip_address", "?")) for a in assets]
-        blast = result.get("total_blast_radius", 0)
-        return f"Resolved {len(assets)} assets: {', '.join(names)}. Total blast radius: {blast:.1f}"
-
-    def _explain_result(self, result: dict) -> str:
-        """Detailed rationale for reasoning trace."""
-        parts = []
-        assets = result.get("affected_assets", [])
-        source = result.get("source_context")
-        target = result.get("target_context")
-
-        if target and isinstance(target, dict):
-            if target.get("hostname"):
-                parts.append(
-                    f"Target {target['ip_address']} resolved to '{target['hostname']}' "
-                    f"(criticality={target.get('criticality_tier')}, "
-                    f"zone={target.get('network_zone', {}).get('zone_name', 'unknown')})."
+        Uses the shared connection pool to avoid a per-call TCP handshake.
+        """
+        try:
+            pool = await _get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """SELECT a.ip_address::text, a.hostname, a.criticality_tier,
+                              z.zone_name AS zone, a.owner
+                       FROM assets a
+                       LEFT JOIN network_zones z ON z.id = a.zone_id
+                       WHERE a.ip_address = $1
+                       LIMIT 1""",
+                    ip,
                 )
-                services = target.get("services", [])
-                if services:
-                    svc_list = [f"{s['service_name']}:{s['port']}" for s in services[:3]]
-                    parts.append(f"  Running services: {', '.join(svc_list)}")
-                deps = target.get("downstream_dependents", [])
-                if deps:
-                    parts.append(f"  {len(deps)} downstream dependents (blast radius: {target.get('blast_radius', 0):.1f})")
-            else:
-                parts.append(f"Target {target.get('ip_address')} not in asset inventory.")
-        else:
-            parts.append("Target IP could not be resolved to any known asset.")
+                return dict(row) if row else None
+        except Exception as e:
+            logger.debug("Asset DB lookup failed: %s", e)
+            return None
 
-        if source and isinstance(source, dict):
-            if source.get("hostname"):
-                parts.append(
-                    f"Source {source['ip_address']} is internal asset '{source['hostname']}' "
-                    f"— possible compromised host."
-                )
-            elif source.get("assessment"):
-                parts.append(f"Source: {source['assessment']}")
-
-        return "\n".join(parts)
+    def _assess_source(self, src_ip: str) -> str:
+        """Classify the alert source as internal or external based on its IP range."""
+        if src_ip.startswith(_PRIVATE_PREFIXES):
+            return "Internal host — possible lateral movement or insider threat"
+        return "External host — likely attacker or compromised external system"

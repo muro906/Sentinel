@@ -1,0 +1,22 @@
+# Test-mode overlay — excludes services that require model artifacts.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f docker-compose.test.yml up -d
+#
+# What runs:    zookeeper, kafka, kafka-ui, postgres, redis,
+#               orchestrator, dashboard-backend, gateway
+# What's skipped: zeek, feature-extractor, detection-service
+#
+# Inject test alerts manually:
+#   python demo/seed_demo.py
+#   python demo/inject_alerts.py --scenario log4shell
+
+services:
+    zeek:
+        profiles: [full]
+
+    feature-extractor:
+        profiles: [full]
+
+    detection-service:
+        profiles: [full]

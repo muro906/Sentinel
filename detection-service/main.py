@@ -46,7 +46,6 @@ log = logging.getLogger("sentinel.detection_service")
 KAFKA_BOOTSTRAP  = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 INPUT_TOPIC      = os.getenv("INPUT_TOPIC",  "network-features")
 OUTPUT_TOPIC     = os.getenv("OUTPUT_TOPIC", "anomaly-alerts")
-THRESHOLD_OVERRIDE = os.getenv("ANOMALY_THRESHOLD")   # optional env override
 EMA_UPDATE_EVERY = int(os.getenv("EMA_UPDATE_EVERY", "1000"))  # update centroid every N normal flows
 POLL_TIMEOUT     = float(os.getenv("POLL_TIMEOUT", "1.0"))
 
@@ -80,13 +79,15 @@ def _wait_for_kafka(bootstrap: str, retries: int = 30, delay: float = 5.0) -> No
     sys.exit(1)
 
 
-def _build_alert(feature_dict: dict, detection: dict, threshold: float) -> dict:
+def _build_alert(feature_dict: dict, detection: dict) -> dict:
     """Construct an AnomalyAlert-compatible dict for the agentic layer."""
     return {
         "alert_id":      f"alert-{uuid.uuid4().hex[:12]}",
         "timestamp":     datetime.now(timezone.utc).isoformat(),
         "anomaly_score": min(1.0, detection["confidence"]),   # normalised [0,1]
-        "classification": "unknown",   # rule-based classification can be added here
+        # Use the label injected by the traffic generator when available;
+        # in production the LLM classifies from context during investigation.
+        "classification": feature_dict.get("classification", "network_anomaly"),
         "feature_vector": {
             "uid":       feature_dict.get("uid", ""),
             "ts":        feature_dict.get("timestamp", ""),
@@ -103,15 +104,15 @@ def _build_alert(feature_dict: dict, detection: dict, threshold: float) -> dict:
             "resp_pkts":  feature_dict.get("resp_pkts", 0),
             "conn_state": feature_dict.get("conn_state", ""),
         },
-        "model_votes": [{
-            "model_name": "et_ssl",
-            "score":      min(1.0, detection["confidence"]),
+        "model_votes": detection.get("model_votes", [{
+            "model_name": detection.get("model_name", "et_ssl"),
+            "score":      detection["anomaly_score"],
             "label":      detection["classification"],
             "confidence": detection["confidence"],
-        }],
+        }]),
         "raw_features": {
-            "et_ssl_raw_score": detection["anomaly_score"],
-            "et_ssl_threshold": threshold,
+            "triggering_model": detection.get("model_name", "et_ssl"),
+            "raw_score":        detection["anomaly_score"],
         },
     }
 
@@ -131,11 +132,9 @@ class DetectionService:
         _wait_for_kafka(KAFKA_BOOTSTRAP)
         _ensure_topics(KAFKA_BOOTSTRAP)
 
-        # Load model
+        # Load ensemble — per-model thresholds come from model_meta.json
+        # or THRESHOLD_<MODEL> env vars. ANOMALY_THRESHOLD is no longer used.
         self._detector = ETSSLDetector.load()
-        if THRESHOLD_OVERRIDE:
-            self._detector._threshold = float(THRESHOLD_OVERRIDE)
-            log.info("Threshold overridden by env: %.4f", self._detector._threshold)
 
         # Kafka consumer
         self._consumer = Consumer({
@@ -185,7 +184,7 @@ class DetectionService:
                 self._processed += 1
 
                 if detection["is_anomaly"]:
-                    alert = _build_alert(feature_dict, detection, self._detector._threshold)
+                    alert = _build_alert(feature_dict, detection)
                     self._producer.produce(
                         OUTPUT_TOPIC,
                         key=feature_dict.get("uid", "").encode("utf-8"),

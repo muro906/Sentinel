@@ -21,45 +21,88 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-import torch
-import torch.nn as nn
 
 log = logging.getLogger("sentinel.detector")
 
 MODEL_DIR   = Path(os.getenv("MODEL_DIR", "/models"))
-DEVICE      = torch.device("cpu")  # inference runs on CPU in production
+
+# Sub-directories for each model inside MODEL_DIR.
+MODEL_NAMES = ["darknet", "ids2018", "unsw"]
 
 # ── Feature constants ─────────────────────────────────────────────────────────
 CONN_STATES        = ["SF", "S0", "REJ", "RSTO", "RSTR", "OTH"]
 CONTINUOUS_INDICES = list(range(12))
 
 
-# ── Encoder (mirrors et_ssl.py, standalone to avoid import path issues) ───────
-class _ETSSLEncoder(nn.Module):
-    """Dynamically builds encoder from hidden_dims tuple read from model_meta.json."""
+# ── Pure-numpy encoder (no torch required at inference) ───────────────────────
 
-    def __init__(
-        self,
-        feature_dim: int,
-        embed_dim:   int,
-        dropout:     float,
-        hidden_dims: tuple[int, ...] = (128, 256, 128),
-    ) -> None:
-        super().__init__()
-        layers: list[nn.Module] = []
-        in_dim = feature_dim
-        for i, h_dim in enumerate(hidden_dims):
-            layers.append(nn.Linear(in_dim, h_dim))
-            layers.append(nn.BatchNorm1d(h_dim))
-            layers.append(nn.ReLU())
-            if i < len(hidden_dims) - 1:
-                layers.append(nn.Dropout(dropout))
-            in_dim = h_dim
-        layers.append(nn.Linear(in_dim, embed_dim))
-        self.net = nn.Sequential(*layers)
+class _NumpyEncoder:
+    """
+    ET-SSL encoder implemented in pure numpy.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    Architecture: Linear → BN+ReLU → [Dropout (identity at inference)] → … → Linear
+    Weights are loaded from encoder_weights.npz exported by prepare_model.py.
+
+    State-dict key mapping (dots → double-underscore in npz):
+        net__0__weight, net__0__bias          → Linear
+        net__1__weight … net__1__running_var  → BatchNorm1d
+        … (higher indices continue the pattern) …
+        net__N__weight, net__N__bias          → Final Linear (no activation)
+    """
+
+    def __init__(self, ops: list) -> None:
+        self._ops = ops   # list of ('linear', W, b) or ('bn_relu', w, b, mean, var)
+
+    @classmethod
+    def load(cls, npz_path: Path) -> "_NumpyEncoder":
+        data = np.load(str(npz_path))
+        # Restore original dot-notation keys
+        sd = {k.replace('__', '.'): data[k] for k in data.files}
+
+        # Group by layer index (e.g. "net.0.weight" → index 0)
+        from collections import defaultdict
+        layer_params: dict = defaultdict(dict)
+        for key, arr in sd.items():
+            parts = key.split('.')   # ['net', '0', 'weight']
+            if len(parts) >= 3:
+                layer_params[int(parts[1])][parts[2]] = arr.astype(np.float32)
+
+        ops = []
+        for idx in sorted(layer_params.keys()):
+            p = layer_params[idx]
+            if 'running_mean' in p:
+                var  = p['running_var'].copy()
+                mean = p['running_mean'].copy()
+                corrupted = bool((var.max() > 100) or (np.abs(mean).max() > 100))
+                if corrupted:
+                    log.debug("BN layer %d: stats corrupted — falling back to per-batch norm", idx)
+                ops.append(('bn_relu', p['weight'], p['bias'], mean, var, corrupted))
+            elif 'weight' in p:
+                ops.append(('linear', p['weight'], p['bias']))
+        return cls(ops)
+
+    def encode(self, x: np.ndarray) -> np.ndarray:
+        """x: (N, feature_dim) float32 → (N, embed_dim) float32"""
+        for op in self._ops:
+            if op[0] == 'linear':
+                x = x @ op[1].T + op[2]
+            elif op[0] == 'bn_relu':
+                _, w, b, mean, var, corrupted = op
+                if corrupted:
+                    # Per-batch layer normalisation fallback for corrupted stats.
+                    # Normalise each feature across the batch; for single samples
+                    # use feature-wise mean/std across the hidden dimension.
+                    if x.shape[0] > 1:
+                        mu  = x.mean(axis=0)
+                        sig = x.std(axis=0) + 1e-5
+                    else:
+                        mu  = x.mean(axis=1, keepdims=True)
+                        sig = x.std(axis=1, keepdims=True) + 1e-5
+                    x = (x - mu) / sig * w + b
+                else:
+                    x = (x - mean) / np.sqrt(var + 1e-5) * w + b
+                x = np.maximum(0, x)
+        return x
 
 
 # ── Feature builder (self-contained copy) ────────────────────────────────────
@@ -90,142 +133,214 @@ def _build_feature_vector(record: dict) -> np.ndarray:
     return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# ── Main Detector class ───────────────────────────────────────────────────────
+# ── Single model ─────────────────────────────────────────────────────────────
+
+class _SingleModel:
+    """One trained ET-SSL model (encoder + scaler + centroid + threshold)."""
+
+    def __init__(self, name: str, encoder, scaler, centroid, threshold):
+        self.name      = name
+        self.encoder   = encoder
+        self.scaler    = scaler
+        self.centroid  = centroid
+        self.threshold = threshold
+        self.degraded  = False   # set to True at load if BN stats are corrupted
+
+    @classmethod
+    def load_from(cls, model_dir: Path, name: str) -> "_SingleModel | None":
+        meta_path = model_dir / "model_meta.json"
+        if not meta_path.exists():
+            return None
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        npz_path = model_dir / "encoder_weights.npz"
+        if not npz_path.exists():
+            log.error("encoder_weights.npz missing in %s — re-run prepare_model.py", model_dir)
+            return None
+
+        encoder  = _NumpyEncoder.load(npz_path)
+        scaler   = joblib.load(model_dir / "scaler.joblib")
+        centroid = np.load(model_dir / "centroid.npy").astype(np.float32)
+        threshold = float(meta.get("threshold") or 0.0)
+
+        env_key = f"THRESHOLD_{name.upper()}"
+        if os.getenv(env_key):
+            threshold = float(os.getenv(env_key))
+            log.info("Threshold for %s overridden by %s=%.4f", name, env_key, threshold)
+
+        m = cls(name, encoder, scaler, centroid, threshold)
+        probe = np.zeros(meta["feature_dim"], dtype=np.float32)
+        probe_score = m.score(probe)
+
+        # If probe_score is > 1000× the threshold the BN stats are too corrupted
+        # to give meaningful anomaly scores — mark as degraded so the ensemble
+        # can skip it rather than flagging every single flow.
+        thr = threshold if threshold > 0 else 1.0
+        # Exclude models where even a zero-vector probe is > 20x the threshold.
+        # Probe scores this high indicate corrupted BN statistics — real traffic
+        # will overflow and flag everything. Only the darknet model passes this.
+        m.degraded = bool(probe_score > thr * 20)
+        if m.degraded:
+            log.warning("Model %-10s DEGRADED (probe_score=%.2e >> threshold=%.4f) "
+                        "— excluded from ensemble until retrained",
+                        name, probe_score, threshold)
+        else:
+            log.info("Loaded model %-10s | embed=%d threshold=%.4f  probe_score=%.4f",
+                     name, meta["embed_dim"], threshold, probe_score)
+        return m
+
+    def score(self, x_raw: np.ndarray) -> float:
+        x = x_raw.copy().reshape(1, -1).astype(np.float32)
+        x[:, CONTINUOUS_INDICES] = self.scaler.transform(
+            x[:, CONTINUOUS_INDICES]
+        ).astype(np.float32)
+        z = self.encoder.encode(x)[0]
+        return float(((z - self.centroid) ** 2).sum())
+
+    def score_batch(self, X_raw: np.ndarray) -> np.ndarray:
+        X = X_raw.copy().astype(np.float32)
+        X[:, CONTINUOUS_INDICES] = self.scaler.transform(
+            X[:, CONTINUOUS_INDICES]
+        ).astype(np.float32)
+        Z = self.encoder.encode(X)
+        return ((Z - self.centroid[None, :]) ** 2).sum(axis=1)
+
+
+# ── Ensemble detector ─────────────────────────────────────────────────────────
+
 class ETSSLDetector:
     """
-    Loads ET-SSL artifacts and scores network feature dicts.
+    Ensemble of all available ET-SSL models.
+
+    Each model specialises in one traffic distribution (darknet, ids2018, unsw).
+    Cross-dataset AUC matrix showed each model fails on other distributions, so
+    running all three and flagging on ANY model exceeding its threshold gives the
+    best coverage across traffic types.
+
+    Directory layout expected under MODEL_DIR:
+        /models/darknet/   encoder_weights.pt  scaler.joblib  centroid.npy  model_meta.json
+        /models/ids2018/   …
+        /models/unsw/      …
+
+    Falls back to MODEL_DIR/ directly for single-model deployments.
 
     Usage:
         detector = ETSSLDetector.load()
         result   = detector.detect(feature_dict)
     """
 
-    def __init__(
-        self,
-        encoder:   _ETSSLEncoder,
-        scaler:    object,
-        centroid:  np.ndarray,
-        threshold: float,
-        feature_dim: int,
-    ) -> None:
-        self._encoder   = encoder
-        self._scaler    = scaler
-        self._centroid  = centroid
-        self._threshold = threshold
-        self._feature_dim = feature_dim
+    def __init__(self, models: list[_SingleModel]) -> None:
+        if not models:
+            raise ValueError("No models loaded — run prepare_model.py first.")
+        self._models = models
+        log.info("Ensemble: %d model(s) — %s",
+                 len(models), [m.name for m in models])
 
     @classmethod
     def load(cls) -> "ETSSLDetector":
-        """Load all artifacts from MODEL_DIR."""
-        meta_path = MODEL_DIR / "model_meta.json"
-        if not meta_path.exists():
+        loaded = []
+
+        # Try sub-directories first (multi-model)
+        for name in MODEL_NAMES:
+            sub = MODEL_DIR / name
+            if sub.is_dir():
+                m = _SingleModel.load_from(sub, name)
+                if m:
+                    loaded.append(m)
+
+        # Fall back to MODEL_DIR itself (single-model, legacy layout)
+        if not loaded:
+            m = _SingleModel.load_from(MODEL_DIR, "default")
+            if m:
+                loaded.append(m)
+
+        if not loaded:
             raise FileNotFoundError(
-                f"model_meta.json not found in {MODEL_DIR}. "
-                "Copy production artifacts from Colab export."
+                f"No model_meta.json found under {MODEL_DIR}. "
+                "Run: python detection-service/prepare_model.py"
             )
-
-        with open(meta_path) as f:
-            meta = json.load(f)
-
-        feature_dim = meta["feature_dim"]
-        embed_dim   = meta["embed_dim"]
-        dropout     = meta.get("dropout", 0.3)
-        threshold   = meta["threshold"]
-        hidden_dims = tuple(meta.get("hidden_dims", [128, 256, 128]))
-
-        encoder = _ETSSLEncoder(
-            feature_dim, embed_dim, dropout, hidden_dims=hidden_dims
-        ).to(DEVICE)
-        state   = torch.load(MODEL_DIR / "encoder_weights.pt", map_location=DEVICE)
-        encoder.load_state_dict(state)
-        encoder.eval()
-
-        scaler   = joblib.load(MODEL_DIR / "scaler.joblib")
-        centroid = np.load(MODEL_DIR / "centroid.npy").astype(np.float32)
-
-        log.info(
-            "ET-SSL detector loaded | embed_dim=%d threshold=%.4f",
-            embed_dim, threshold,
-        )
-        return cls(encoder, scaler, centroid, threshold, feature_dim)
+        active = [m for m in loaded if not m.degraded]
+        if not active:
+            log.error("All models degraded — using them anyway with caution")
+            active = loaded
+        elif len(active) < len(loaded):
+            log.warning("%d/%d model(s) active (others degraded — need retraining)",
+                        len(active), len(loaded))
+        return cls(active)
 
     # ── Inference ─────────────────────────────────────────────────────────────
-    def score(self, record: dict) -> float:
-        """Return anomaly score S(t) = ||z - μ_norm||² for one record."""
-        x = _build_feature_vector(record)
-        # Scale only continuous columns
-        x[CONTINUOUS_INDICES] = self._scaler.transform(
-            x[CONTINUOUS_INDICES].reshape(1, -1)
-        ).flatten().astype(np.float32)
 
-        with torch.no_grad():
-            z      = self._encoder(torch.from_numpy(x).unsqueeze(0).to(DEVICE))
-            z_np   = z.cpu().numpy()[0]
-        diff   = z_np - self._centroid
-        return float((diff ** 2).sum())
+    def _ensemble_score(self, x_raw: np.ndarray) -> tuple[float, str, list[dict]]:
+        """
+        Score one feature vector with all models.
+        Returns (max_normalised_confidence, triggering_model_name, per_model_votes).
+        Flagged if ANY model exceeds its threshold (union rule — highest recall).
+        """
+        votes = []
+        for m in self._models:
+            raw   = m.score(x_raw)
+            thr   = m.threshold if m.threshold > 0 else 1.0
+            norm  = float(1 / (1 + np.exp(-(raw - thr) / (thr + 1e-9))))
+            votes.append({
+                "model_name": m.name,
+                "score":      raw,
+                "threshold":  thr,
+                "is_anomaly": raw > thr,
+                "confidence": norm,
+            })
+
+        triggered = [v for v in votes if v["is_anomaly"]]
+        is_anomaly = bool(triggered)
+        # Pick the most confident triggering model (or highest score if none triggered)
+        if triggered:
+            best = max(triggered, key=lambda v: v["confidence"])
+        else:
+            best = max(votes, key=lambda v: v["confidence"])
+
+        return is_anomaly, best["model_name"], best["confidence"], votes
 
     def detect(self, record: dict) -> dict:
-        """
-        Full detection result for one feature record.
-
-        Returns dict with:
-            anomaly_score  – float [0, ∞)
-            is_anomaly     – bool
-            classification – str  ('anomaly' | 'normal')
-            model_name     – 'et_ssl'
-            confidence     – float [0, 1]  (sigmoid of normalised score)
-        """
-        raw_score  = self.score(record)
-        is_anomaly = raw_score > self._threshold
-        # Normalise score to [0,1] via sigmoid around threshold
-        normalised = float(1 / (1 + np.exp(-(raw_score - self._threshold) / (self._threshold + 1e-9))))
+        x = _build_feature_vector(record)
+        is_anomaly, model_name, confidence, votes = self._ensemble_score(x)
         return {
-            "anomaly_score":  raw_score,
+            "anomaly_score":  max(v["score"] for v in votes),
             "is_anomaly":     is_anomaly,
             "classification": "anomaly" if is_anomaly else "normal",
-            "model_name":     "et_ssl",
-            "confidence":     normalised,
+            "model_name":     model_name,
+            "confidence":     confidence,
+            "model_votes":    votes,
         }
 
     def detect_batch(self, records: list[dict]) -> list[dict]:
-        """Score a list of records efficiently."""
         if not records:
             return []
-        # Build matrix
-        X = np.stack([_build_feature_vector(r) for r in records])
-        X[:, CONTINUOUS_INDICES] = self._scaler.transform(
-            X[:, CONTINUOUS_INDICES]
-        ).astype(np.float32)
-
-        with torch.no_grad():
-            Z = self._encoder(torch.from_numpy(X).to(DEVICE)).cpu().numpy()
-
-        diffs  = Z - self._centroid[None, :]
-        scores = (diffs ** 2).sum(axis=1)
-
+        X_raw = np.stack([_build_feature_vector(r) for r in records])
         results = []
-        for score in scores:
-            is_anom  = bool(score > self._threshold)
-            norm     = float(1 / (1 + np.exp(-(score - self._threshold) / (self._threshold + 1e-9))))
+        for i in range(len(X_raw)):
+            is_anomaly, model_name, confidence, votes = self._ensemble_score(X_raw[i])
             results.append({
-                "anomaly_score":  float(score),
-                "is_anomaly":     is_anom,
-                "classification": "anomaly" if is_anom else "normal",
-                "model_name":     "et_ssl",
-                "confidence":     norm,
+                "anomaly_score":  max(v["score"] for v in votes),
+                "is_anomaly":     is_anomaly,
+                "classification": "anomaly" if is_anomaly else "normal",
+                "model_name":     model_name,
+                "confidence":     confidence,
+                "model_votes":    votes,
             })
         return results
 
     def update_centroid(self, normal_records: list[dict], alpha: float = 0.95) -> None:
-        """EMA-update centroid with new normal traffic observations."""
+        """EMA-update centroids in all models with new normal traffic observations."""
         if not normal_records:
             return
-        X = np.stack([_build_feature_vector(r) for r in normal_records])
-        X[:, CONTINUOUS_INDICES] = self._scaler.transform(
-            X[:, CONTINUOUS_INDICES]
-        ).astype(np.float32)
-        with torch.no_grad():
-            Z = self._encoder(torch.from_numpy(X).to(DEVICE)).cpu().numpy()
-        new_mean       = Z.mean(axis=0).astype(np.float32)
-        self._centroid = (alpha * self._centroid + (1 - alpha) * new_mean).astype(np.float32)
-        log.debug("Centroid updated via EMA (alpha=%.2f)", alpha)
+        X_raw = np.stack([_build_feature_vector(r) for r in normal_records])
+        for m in self._models:
+            X = X_raw.copy().astype(np.float32)
+            X[:, CONTINUOUS_INDICES] = m.scaler.transform(
+                X[:, CONTINUOUS_INDICES]
+            ).astype(np.float32)
+            Z = m.encoder.encode(X)
+            new_mean   = Z.mean(axis=0).astype(np.float32)
+            m.centroid = (alpha * m.centroid + (1 - alpha) * new_mean).astype(np.float32)
+        log.debug("Centroids EMA-updated across %d models (alpha=%.2f)",
+                  len(self._models), alpha)

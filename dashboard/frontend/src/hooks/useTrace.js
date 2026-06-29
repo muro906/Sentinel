@@ -4,12 +4,16 @@ import api from "../lib/api";
 import {useWebSocket} from './useWebSocket'
 
 export function useTrace(alertId){
-    const [live, setLive] = useState([]); // Accumulates real-time trace events pushed over WebSocket
-    // Fetch historical trace events for the alert from the REST API
+    const [live, setLive] = useState([]);
     const query = useQuery({
         queryKey: ['trace', alertId],
         queryFn: () => api.get(`/traces/${alertId}/trace`).then(res => res.data),
-        enabled: !!alertId, // Prevents fetching until a valid alertId is available
+        enabled: !!alertId,
+        // Poll every 4 s so traces appear in real time during an active investigation.
+        // The backend merges Postgres (durable) + Redis (live), so this always returns
+        // the complete picture without duplicates.
+        refetchInterval: 4000,
+        staleTime: 0,
     })
 
     // Append each incoming WebSocket frame to the live events list

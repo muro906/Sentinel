@@ -15,7 +15,7 @@ async def get_trace_from_db(alert_id: str) -> list[dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT event_id,alert_id,event_type,agent_name,action,rationale,"
+            "SELECT event_id,alert_id,event_type,agent,action,rationale,"
             "input_summary,output_summary,confidence,duration_ms,timestamp "
             "FROM reasoning_traces WHERE alert_id=$1 ORDER BY timestamp ASC",
             alert_id

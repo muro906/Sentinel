@@ -1,0 +1,90 @@
+networks:
+    assets-dmz:
+        driver: bridge
+        ipam:
+            config:
+                - subnet: 10.0.0.0/24
+                  gateway: 10.0.0.254
+    assets-internal:
+        driver: bridge
+        ipam:
+            config:
+                - subnet: 192.168.1.0/24
+                  gateway: 192.168.1.254
+
+services:
+    asset-web-prod-01:
+        image: nginx:alpine
+        container_name: sentinel-asset-web-prod-01
+        hostname: web-prod-01
+        restart: unless-stopped
+        networks:
+            assets-dmz:
+                ipv4_address: 10.0.0.1
+        profiles: [assets]
+
+    asset-web-prod-02:
+        image: nginx:alpine
+        container_name: sentinel-asset-web-prod-02
+        hostname: web-prod-02
+        restart: unless-stopped
+        networks:
+            assets-dmz:
+                ipv4_address: 10.0.0.2
+        profiles: [assets]
+
+    asset-api-gateway:
+        image: nginx:alpine
+        container_name: sentinel-asset-api-gateway
+        hostname: api-gateway
+        restart: unless-stopped
+        networks:
+            assets-dmz:
+                ipv4_address: 10.0.0.10
+        profiles: [assets]
+
+    asset-dns-resolver:
+        image: alpine
+        container_name: sentinel-asset-dns-resolver
+        hostname: dns-resolver
+        restart: unless-stopped
+        command: tail -f /dev/null
+        networks:
+            assets-dmz:
+                ipv4_address: 10.0.0.53
+        profiles: [assets]
+
+    asset-db-internal:
+        image: postgres:16-alpine
+        container_name: sentinel-asset-db-internal
+        hostname: db-internal
+        restart: unless-stopped
+        environment:
+            POSTGRES_PASSWORD: asset_demo
+        networks:
+            assets-internal:
+                ipv4_address: 192.168.1.100
+        profiles: [assets]
+
+    asset-auth-server:
+        image: alpine
+        container_name: sentinel-asset-auth-server
+        hostname: auth-server
+        restart: unless-stopped
+        command: tail -f /dev/null
+        networks:
+            assets-internal:
+                ipv4_address: 192.168.1.200
+        profiles: [assets]
+
+    # Attach orchestrator to both asset networks and mount Docker socket
+    # so docker exec commands can target the asset containers.
+    orchestrator:
+        networks:
+            sentinel-net: {}
+            assets-dmz: {}
+            assets-internal: {}
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+        environment:
+            ASSET_EXEC_MODE: "docker_exec"

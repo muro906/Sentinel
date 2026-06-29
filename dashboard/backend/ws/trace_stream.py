@@ -3,9 +3,10 @@
 Streams real-time agent activity from Redis streams to connected clients.
 """
 
+import asyncio
 import json
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from core.security import decode_token
 from state.redis_client import get_redis
@@ -15,21 +16,29 @@ router = APIRouter()
 
 
 @router.websocket("/ws/alerts/{alert_id}/trace")
-async def trace_ws(alert_id: str, ws: WebSocket, token: str = Query(...)) -> None:
+async def trace_ws(alert_id: str, ws: WebSocket) -> None:
     """WebSocket endpoint for streaming reasoning traces for an alert.
-    
-    Connects to Redis stream and pushes new trace events to the client.
-    Uses blocking read with timeout to enable periodic ping messages.
-    
-    Args:
-        alert_id: The alert identifier for the trace stream.
-        ws: The WebSocket connection object.
-        token: JWT access token passed as query parameter.
-        
-    Note:
-        Connection is closed with code 4001 if authentication fails.
+
+    Accepts the connection, then expects the client to send a JSON auth
+    message as the very first frame: {"type": "auth", "token": "<jwt>"}.
+    The token is validated before the connection is registered, keeping
+    the JWT out of URLs and server access logs.
+
+    Connection is closed with code 4001 if authentication fails or times out.
     """
-    # Validate JWT token
+    await ws.accept()
+
+    try:
+        auth_msg = await asyncio.wait_for(ws.receive_json(), timeout=10)
+    except (asyncio.TimeoutError, Exception):
+        await ws.close(code=4001)
+        return
+
+    token = auth_msg.get("token") if isinstance(auth_msg, dict) else None
+    if not token:
+        await ws.close(code=4001)
+        return
+
     try:
         payload = decode_token(token)
         if payload.get("type") != "access":
@@ -38,9 +47,8 @@ async def trace_ws(alert_id: str, ws: WebSocket, token: str = Query(...)) -> Non
     except Exception:
         await ws.close(code=4001)
         return
-    
-    # Register connection to alert-specific channel
-    await manager.connect(f"trace:{alert_id}", ws)
+
+    manager.register(f"trace:{alert_id}", ws)
     redis = await get_redis()
     last_id = "0-0"  # Start from beginning of stream
     try:

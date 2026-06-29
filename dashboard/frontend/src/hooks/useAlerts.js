@@ -10,11 +10,20 @@ export function useAlerts(params){
     })
 }
 
-// Fetches a single alert by ID; does not run until a valid alertid is provided
+// Fetches a single alert by ID; polls every 5s while a plan is executing so the
+// UI detects the approved → closed transition without a manual refresh.
 export function useAlert(alertId){
     return useQuery({
         queryKey: ['alert', alertId],
         queryFn: () => api.get(`/alerts/${alertId}`).then(res => res.data),
-        enabled: !!alertId, // Prevents fetching when alertid is null/undefined
+        enabled: !!alertId,
+        // Poll during active investigation states so the UI transitions automatically:
+        //   triaged        → agents running,  poll until plans appear
+        //   plans_generated→ waiting for analyst action, no need to poll
+        //   approved       → execution running, poll until closed
+        refetchInterval: (query) => {
+            const s = query.state.data?.approval_status
+            return (s === 'triaged' || s === 'approved') ? 5_000 : false
+        },
     })
 }

@@ -1,7 +1,7 @@
-import {useState} from 'react'
+import {useState, useEffect} from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import axios from 'axios'
-import {Shield, ArrowLeft} from 'lucide-react'
+import {Shield, ArrowLeft, User, Mail, Lock, Check, X} from 'lucide-react'
 import {Spinner} from '../components/ui/Spinner'
 
 export default function Register(){
@@ -14,7 +14,38 @@ export default function Register(){
     const [error, setError] = useState('')
     const [success, setSuccess] = useState('')
     const [loading, setLoading] = useState(false)
+    const [usernameAvailable, setUsernameAvailable] = useState(null) // null = not checked, true = available, false = taken
+    const [checkingUsername, setCheckingUsername] = useState(false)
     const navigate = useNavigate()
+
+    // Check username availability
+    useEffect(() => {
+        const checkUsername = async () => {
+            if (formData.username.length < 3) {
+                setUsernameAvailable(null)
+                return
+            }
+            
+            setCheckingUsername(true)
+            try {
+                const response = await axios.get(`/api/auth/check-username?username=${formData.username}`)
+                setUsernameAvailable(response.data.available)
+            } catch (err) {
+                // Only treat 404 (endpoint or username not found) as available
+                // Network errors or 5xx should not show a green check
+                if (err?.response?.status === 404) {
+                    setUsernameAvailable(true)
+                } else {
+                    setUsernameAvailable(null)
+                }
+            } finally {
+                setCheckingUsername(false)
+            }
+        }
+
+        const debounceTimer = setTimeout(checkUsername, 500)
+        return () => clearTimeout(debounceTimer)
+    }, [formData.username])
 
     const handleSubmit = async e => {
         e.preventDefault();
@@ -22,6 +53,23 @@ export default function Register(){
         setSuccess('');
         
         // Validation
+        if (formData.username.length < 3) {
+            setError('Username must be at least 3 characters')
+            return
+        }
+        
+        if (usernameAvailable === false) {
+            setError('Username is already taken')
+            return
+        }
+        
+        // Email validation
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(formData.email)) {
+            setError('Please enter a valid email address')
+            return
+        }
+        
         if (formData.password !== formData.confirmPassword) {
             setError('Passwords do not match')
             return
@@ -39,7 +87,7 @@ export default function Register(){
                 password: formData.password
             })
             
-            setSuccess(data.detail)
+            setSuccess(data.detail || 'Registration successful. Please wait for admin approval.')
             // Clear form
             setFormData({username: '', email: '', password: '', confirmPassword: ''})
             
@@ -48,7 +96,8 @@ export default function Register(){
                 navigate('/login')
             }, 3000)
         } catch(err){
-            const msg = err?.response?.data?.detail || 'Registration failed. Please try again.'
+            console.error('Registration error:', err)
+            const msg = err?.response?.data?.detail || err?.message || 'Registration failed. Please try again.'
             setError(msg)
         } finally {
             setLoading(false)
@@ -85,57 +134,77 @@ export default function Register(){
                     
                     <div>
                         <label className="text-xs text-theme-secondary block mb-1">Username</label>
-                        <input 
-                            type="text" 
-                            name="username"
-                            value={formData.username}
-                            onChange={handleChange}
-                            className="w-full bg-theme-base border border-theme rounded px-3 py-2 text-sm text-theme-primary focus:outline-none focus:border-blue-500"
-                            required
-                            minLength={3}
-                            autoComplete='username'
-                        />
+                        <div className="relative">
+                            <User size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted" />
+                            <input 
+                                type="text" 
+                                name="username"
+                                value={formData.username}
+                                onChange={handleChange}
+                                className="w-full bg-theme-base border border-theme rounded pl-9 pr-10 py-2 text-sm text-theme-primary focus:outline-none focus:border-blue-500"
+                                required
+                                minLength={3}
+                                autoComplete='username'
+                            />
+                            <div className="absolute right-3 top-1/2 -translate-y-1/2">
+                                {checkingUsername && <Spinner className="h-4 w-4" />}
+                                {!checkingUsername && usernameAvailable === true && <Check size={16} className="text-emerald-400" />}
+                                {!checkingUsername && usernameAvailable === false && <X size={16} className="text-red-400" />}
+                            </div>
+                        </div>
+                        {usernameAvailable === false && (
+                            <p className="text-xs text-red-400 mt-1">Username is already taken</p>
+                        )}
                     </div>
 
                     <div>
                         <label className="text-xs text-theme-secondary block mb-1">Email</label>
-                        <input 
-                            type="email" 
-                            name="email"
-                            value={formData.email}
-                            onChange={handleChange}
-                            className="w-full bg-theme-base border border-theme rounded px-3 py-2 text-sm text-theme-primary focus:outline-none focus:border-blue-500"
-                            required
-                            autoComplete='email'
-                        />
+                        <div className="relative">
+                            <Mail size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted" />
+                            <input 
+                                type="email" 
+                                name="email"
+                                value={formData.email}
+                                onChange={handleChange}
+                                className="w-full bg-theme-base border border-theme rounded pl-9 pr-3 py-2 text-sm text-theme-primary focus:outline-none focus:border-blue-500"
+                                required
+                                autoComplete='email'
+                            />
+                        </div>
                     </div>
 
                     <div>
                         <label className="text-xs text-theme-secondary block mb-1">Password</label>
-                        <input 
-                            type="password" 
-                            name="password"
-                            value={formData.password}
-                            onChange={handleChange}
-                            className="w-full bg-theme-base border border-theme rounded px-3 py-2 text-sm text-theme-primary focus:outline-none focus:border-blue-500"
-                            required
-                            minLength={8}
-                            autoComplete='new-password'
-                        />
+                        <div className="relative">
+                            <Lock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted" />
+                            <input 
+                                type="password" 
+                                name="password"
+                                value={formData.password}
+                                onChange={handleChange}
+                                className="w-full bg-theme-base border border-theme rounded pl-9 pr-3 py-2 text-sm text-theme-primary focus:outline-none focus:border-blue-500"
+                                required
+                                minLength={8}
+                                autoComplete='new-password'
+                            />
+                        </div>
                         <p className="text-xs text-theme-muted mt-1">Minimum 8 characters</p>
                     </div>
 
                     <div>
                         <label className="text-xs text-theme-secondary block mb-1">Confirm Password</label>
-                        <input 
-                            type="password" 
-                            name="confirmPassword"
-                            value={formData.confirmPassword}
-                            onChange={handleChange}
-                            className="w-full bg-theme-base border border-theme rounded px-3 py-2 text-sm text-theme-primary focus:outline-none focus:border-blue-500"
-                            required
-                            autoComplete='new-password'
-                        />
+                        <div className="relative">
+                            <Lock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted" />
+                            <input 
+                                type="password" 
+                                name="confirmPassword"
+                                value={formData.confirmPassword}
+                                onChange={handleChange}
+                                className="w-full bg-theme-base border border-theme rounded pl-9 pr-3 py-2 text-sm text-theme-primary focus:outline-none focus:border-blue-500"
+                                required
+                                autoComplete='new-password'
+                            />
+                        </div>
                     </div>
 
                     <button 

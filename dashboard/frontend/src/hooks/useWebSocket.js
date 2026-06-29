@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useAuthStore } from "../store/auth";
 export function useWebSocket(path, onMessage, enabled = true){
-    // WebSocket is disabled in dev/mock mode (MSW cannot intercept WS connections)
-    if (import.meta.env.DEV) return;
     const ws = useRef(null);
     const token = useAuthStore((state)=> state.accessToken);
 
     const connect = useCallback(() => {
-        if(!token || !enabled) return
+        // WebSocket is disabled in dev/mock mode (MSW cannot intercept WS connections)
+        if(import.meta.env.DEV || !token || !enabled) return
         const proto = location.protocol === 'https:' ? 'wss' :'ws'
 
-        const socket = new WebSocket(`${proto}://${location.host}${path}?token=${encodeURIComponent(token)}`)
+        const socket = new WebSocket(`${proto}://${location.host}${path}`)
+        socket.onopen = () => {
+            socket.send(JSON.stringify({ type: 'auth', token }))
+        }
         socket.onmessage = (e) => {
             try{
                 const data = JSON.parse(e.data);
@@ -20,7 +22,7 @@ export function useWebSocket(path, onMessage, enabled = true){
 
         //Auto-reconnect after 3s on unexpected close
         socket.onclose = (e) => {
-            if(e.code != 1000 & enabled){
+            if((e.code != 1000) && enabled){
                 setTimeout(connect, 3000)
             }
         }

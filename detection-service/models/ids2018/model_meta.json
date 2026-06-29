@@ -1,0 +1,14 @@
+{
+  "feature_dim": 20,
+  "embed_dim": 128,
+  "dropout": 0.137469907131237,
+  "threshold": 2.0,
+  "hidden_dims": [
+    256,
+    512,
+    512
+  ],
+  "dataset": "ids2018",
+  "val_auc": 0.8951412789405857,
+  "test_auc": 0.23015244444444444
+}

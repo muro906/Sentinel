@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { ShieldOff, History, Zap, ArrowUpCircle, User, Clock } from 'lucide-react'
+import { ShieldOff, History, Zap, ArrowUpCircle, User, Clock, Search } from 'lucide-react'
 import { useAlerts } from "../hooks/useAlerts";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useAlertsStore } from '../store/alerts'
@@ -74,8 +74,10 @@ function EscalationBanner({ escalations, onDismiss, navigate }) {
 }
 
 export default function AlertFeed() {
-    const [tab, setTab] = useState('active')   // 'active' | 'history'
-    const [priority, setPriority] = useState('')
+    const [searchParams] = useSearchParams()
+    const [tab, setTab] = useState(searchParams.get('tab') === 'history' ? 'history' : 'active')
+    const [priority, setPriority] = useState(searchParams.get('priority') || '')
+    const [search, setSearch] = useState('')
     const navigate = useNavigate()
     const qc = useQueryClient()
     const push = useAlertsStore(state => state.pushNotification)
@@ -94,6 +96,15 @@ export default function AlertFeed() {
             push({ ...msg, received_at: new Date().toISOString() })
             qc.invalidateQueries({ queryKey: ['alerts'] })
             toast({ type: 'warning', title: 'New alert plans ready', message: `Alert ${msg.alert_id} has new plans awaiting review.` })
+        }
+        if (msg.type === 'new_alert') {
+            push({ ...msg, received_at: new Date().toISOString() })
+            qc.invalidateQueries({ queryKey: ['alerts'] })
+            toast({ type: 'info', title: 'New alert received', message: `Alert ${msg.alert_id} (${msg.classification}) requires investigation.` })
+        }
+        if (msg.type === 'investigation_started') {
+            qc.invalidateQueries({ queryKey: ['alerts'] })
+            toast({ type: 'info', title: 'Investigation started', message: `Alert ${msg.alert_id} investigation in progress.` })
         }
 
         // Show escalation requests to senior analysts and admins
@@ -122,10 +133,18 @@ export default function AlertFeed() {
 
     const shownAlerts = tab === 'active' ? activeAlerts : historyAlerts
 
-    // Apply priority filter client-side after split (backend already filtered by priority)
-    const filtered = priority
-        ? shownAlerts.filter(a => a.priority === priority)
-        : shownAlerts
+    // Apply priority filter and search client-side
+    const searchLower = search.trim().toLowerCase()
+    const filtered = shownAlerts.filter(a => {
+      const matchesPriority = !priority || a.priority === priority
+      const matchesSearch = !searchLower ||
+        a.classification?.toLowerCase().includes(searchLower) ||
+        a.alert_id?.toLowerCase().includes(searchLower) ||
+        a.src_ip?.toLowerCase().includes(searchLower) ||
+        a.dst_ip?.toLowerCase().includes(searchLower) ||
+        a.assigned_to?.toLowerCase().includes(searchLower)
+      return matchesPriority && matchesSearch
+    })
 
     return (
         <div className="space-y-4">
@@ -138,6 +157,17 @@ export default function AlertFeed() {
                     </p>
                 </div>
                 <div className="flex items-center gap-2 flex-wrap">
+                    {/* Text search */}
+                    <div className="relative">
+                        <Search size={12} className="absolute left-2.5 top-2 text-theme-muted" />
+                        <input
+                            type="text"
+                            value={search}
+                            onChange={e => setSearch(e.target.value)}
+                            placeholder="Search classification, IP, ID…"
+                            className="bg-theme-raised border border-theme text-xs text-theme-primary rounded pl-7 pr-3 py-1.5 focus:outline-none focus:border-blue-500 w-48"
+                        />
+                    </div>
                     {/* Priority filter */}
                     <select
                         value={priority}
@@ -228,7 +258,7 @@ export default function AlertFeed() {
                                     <div className="flex flex-col items-center justify-center py-16 gap-2">
                                         <ShieldOff size={32} className="text-theme-muted opacity-40" />
                                         <p className="text-sm text-theme-muted">
-                                            {tab === 'active' ? 'No active alerts' : 'No resolved alerts yet'}
+                                            {search.trim() ? 'No alerts match your search' : tab === 'active' ? 'No active alerts' : 'No resolved alerts yet'}
                                         </p>
                                         <p className="text-xs text-theme-muted opacity-60">
                                             {tab === 'active'

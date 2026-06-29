@@ -1,0 +1,37 @@
+
+docker compose -f docker-compose.yml -f docker-compose.assets.yml --profile assets up -d
+docker compose -f docker-compose.yml -f docker-compose.assets.yml --profile assets up -d
+
+docker exec -i sentinel-postgres psql -U sentinel -d sentinel << 'EOF'
+DELETE FROM asset_dependencies; DELETE FROM services; DELETE FROM assets; DELETE FROM network_zones;
+
+INSERT INTO network_zones (zone_name, subnet, vlan_id, trust_level, description) VALUES
+  ('dmz','10.0.0.0/24',100,2,'Public-facing servers'),
+  ('internal','192.168.1.0/24',200,3,'Corporate workstations'),
+  ('management','192.168.100.0/24',300,4,'Infrastructure management'),
+  ('external','172.16.0.0/16',NULL,1,'Untrusted external range')
+ON CONFLICT (zone_name) DO UPDATE SET subnet=EXCLUDED.subnet;
+
+INSERT INTO assets (hostname,ip_address,mac_address,os,os_version,owner,department,criticality_tier,asset_type,zone_id)
+SELECT v.h,v.ip::inet,v.mac::macaddr,v.osn,v.osv,v.own,v.dept,v.crit,v.atype,z.id
+FROM (VALUES
+  ('web-prod-01','10.0.0.1','AA:BB:CC:DD:01:01','Ubuntu 22.04','22.04.3 LTS','infra-team','Engineering',2,'server','dmz'),
+  ('web-prod-02','10.0.0.2','AA:BB:CC:DD:01:02','Ubuntu 22.04','22.04.3 LTS','infra-team','Engineering',2,'server','dmz'),
+  ('api-gateway','10.0.0.10','AA:BB:CC:DD:01:10','Alpine 3.19','3.19.1','platform-team','Engineering',1,'server','dmz'),
+  ('dns-resolver','10.0.0.53','AA:BB:CC:DD:01:53','Ubuntu 22.04','22.04.3 LTS','infra-team','Engineering',2,'server','dmz'),
+  ('dev-workstation-01','192.168.1.10','AA:BB:CC:DD:02:10','macOS 14','14.2','alice','Engineering',4,'workstation','internal'),
+  ('dev-workstation-02','192.168.1.11','AA:BB:CC:DD:02:11','Ubuntu 22.04','22.04.3 LTS','bob','Engineering',4,'workstation','internal'),
+  ('dev-workstation-03','192.168.1.12','AA:BB:CC:DD:02:12','Windows 11','23H2','charlie','Engineering',4,'workstation','internal'),
+  ('db-internal','192.168.1.100','AA:BB:CC:DD:02:A0','Ubuntu 22.04','22.04.3 LTS','infra-team','Engineering',1,'server','internal'),
+  ('auth-server','192.168.1.200','AA:BB:CC:DD:02:C8','Ubuntu 22.04','22.04.3 LTS','security-team','Security',1,'server','internal')
+) AS v(h,ip,mac,osn,osv,own,dept,crit,atype,zname)
+JOIN network_zones z ON z.zone_name=v.zname
+ON CONFLICT (hostname) DO UPDATE SET ip_address=EXCLUDED.ip_address, zone_id=EXCLUDED.zone_id;
+EOF
+
+bash scripts/demo_reset.sh
+
+bash scripts/demo.sh --mode normal --profile assets --loop 30 30
+bash scripts/demo.sh --mode anomalous --profile assets --loop 60
+docker compose -f docker-compose.yml -f docker-compose.assets.yml --profile assets down
+

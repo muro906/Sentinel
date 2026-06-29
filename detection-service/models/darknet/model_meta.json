@@ -1,0 +1,13 @@
+{
+  "feature_dim": 20,
+  "embed_dim": 256,
+  "dropout": 0.37282090496535014,
+  "threshold": 3.317415952682495,
+  "hidden_dims": [
+    256,
+    1024
+  ],
+  "dataset": "darknet",
+  "val_auc": 0.6799303701056094,
+  "test_auc": 0.6725240926938008
+}

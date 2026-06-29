@@ -1,0 +1,103 @@
+# Sentinel — Live Traffic Testing Overlay
+# =========================================
+# Adds two services to the stack:
+#   traffic-gen    — generates benign and attack traffic using real tools
+#   packet-capture — tcpdump on sentinel-net, rotates PCAPs into Zeek's watch dir
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.traffic.yml up
+#
+# The two services are co-dependent:
+#   traffic-gen generates actual TCP/UDP/ICMP flows on sentinel-net
+#   packet-capture captures those flows and drops PCAPs for Zeek to process
+
+services:
+
+    # ── Live packet capture ───────────────────────────────────────────────────
+    # Captures traffic on sentinel-net and rotates PCAPs every 30s.
+    # Each PCAP lands in capture/pcap/ which Zeek is watching.
+    packet-capture:
+        image: nicolaka/netshoot
+        container_name: sentinel-packet-capture
+        network_mode: "host"                   # needs host net to see sentinel-net bridge
+        cap_add: [NET_RAW, NET_ADMIN]
+        volumes:
+            - ./capture/pcap:/pcap
+        command: >
+            sh -c "
+              IFACE=$(ip route | awk '/sentinel-net/ {print $$3}' | head -1);
+              [ -z \"$$IFACE\" ] && IFACE=eth0;
+              echo \"Capturing on $$IFACE → /pcap/live-\$(date +%s).pcap\";
+              while true; do
+                OUT=/pcap/live-\$(date +%s).pcap;
+                tcpdump -i $$IFACE -w $$OUT -G 30 -W 1
+                  'not port 9092 and not port 5432 and not port 6379' 2>/dev/null;
+                echo \"[capture] Rotated → $$OUT\";
+              done
+            "
+        restart: unless-stopped
+
+    # ── Traffic generator ─────────────────────────────────────────────────────
+    # Runs attack and benign traffic scenarios against the asset IPs.
+    # Loops continuously so the detection pipeline stays fed.
+    traffic-gen:
+        image: instrumentisto/nmap
+        container_name: sentinel-traffic-gen
+        networks:
+            - sentinel-net
+        cap_add: [NET_RAW]
+        depends_on:
+            - packet-capture
+        environment:
+            TARGET_DMZ_WEB:  "10.0.0.1"
+            TARGET_API:      "10.0.0.10"
+            TARGET_DB:       "192.168.1.100"
+            ATTACKER_IP:     "172.16.0.1"
+            LOOP_SECS:       "60"
+        entrypoint: >
+            sh -c "
+              apk add --no-cache hping3 curl masscan nikto perl 2>/dev/null;
+              echo '[traffic-gen] Starting traffic loop every $$LOOP_SECS s';
+              while true; do
+
+                echo '[traffic-gen] === Benign: HTTP requests ===';
+                curl -s --max-time 3 http://$$TARGET_DMZ_WEB/ > /dev/null || true;
+                curl -s --max-time 3 http://$$TARGET_API/health > /dev/null || true;
+                for i in 1 2 3 4 5; do
+                  curl -s --max-time 2 http://$$TARGET_DMZ_WEB/index.html > /dev/null || true;
+                  sleep 1;
+                done;
+
+                echo '[traffic-gen] === Recon: nmap full connect scan ===';
+                nmap -sT -F --max-retries 1 --host-timeout 10s $$TARGET_API 2>/dev/null || true;
+
+                echo '[traffic-gen] === Recon: masscan (ultra-fast port sweep) ===';
+                masscan $$TARGET_DMZ_WEB -p1-1024 --rate=1000 2>/dev/null || true;
+
+                echo '[traffic-gen] === Web scan: nikto on web server ===';
+                nikto -h http://$$TARGET_DMZ_WEB -maxtime 20s -nointeractive 2>/dev/null || true;
+
+                echo '[traffic-gen] === DoS: SYN flood (5s) on web:80 ===';
+                timeout 5 hping3 --syn --flood -p 80 $$TARGET_DMZ_WEB 2>/dev/null || true;
+
+                echo '[traffic-gen] === DoS: UDP flood (3s) ===';
+                timeout 3 hping3 --udp --flood -p 53 $$TARGET_DMZ_WEB 2>/dev/null || true;
+
+                echo '[traffic-gen] === Lateral movement: scan db-internal ===';
+                nmap -sT -p 5432,3306,6379,27017,9200,8080 --max-retries 1 $$TARGET_DB 2>/dev/null || true;
+
+                echo '[traffic-gen] === Brute force simulation: rapid SSH connections ===';
+                for i in $(seq 1 20); do
+                  timeout 1 sh -c \"echo '' | nc -w1 $$TARGET_DMZ_WEB 22\" 2>/dev/null || true;
+                done;
+
+                echo '[traffic-gen] === Sleeping $$LOOP_SECS s ===';
+                sleep $$LOOP_SECS;
+              done
+            "
+        restart: unless-stopped
+
+networks:
+    sentinel-net:
+        external: true
+        name: sentinel_sentinel-net
